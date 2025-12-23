@@ -1,10 +1,10 @@
 import serial
 
 # Połączenie
-ser = serial.Serial('COM7', 115200)
+ser = serial.Serial('COM7', 250000)
 
 while True:
-    line = ser.readline().decode('ascii').strip()
+    line = ser.readline().decode('utf-8', errors='ignore').strip()
     if line.startswith("FRAME:"):
         # Usuwamy prefiks i tniemy dane
         payload = line.replace("FRAME:", "")
