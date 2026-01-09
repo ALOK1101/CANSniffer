@@ -7,3 +7,4 @@ build/
 *.egg-info/
 function_codes.json
 deciphered_ids.json
+can_log*
