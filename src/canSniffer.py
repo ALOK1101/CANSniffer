@@ -7,220 +7,1254 @@ from tkinter import ttk, messagebox
 import json
 import os
 import time
+import queue
+import csv
 from datetime import datetime
+from typing import Dict, List, Optional
 
-# --- USTAWIENIA PROJEKTU ---
+# --- PROJECT SETTINGS ---
 BAUD = 115200
 DB_IDS = 'deciphered_ids.json'
 DB_FUNCTIONS = 'function_codes.json'
-MAX_ALL_ROWS = 100  # Bufor dla widoku strumieniowego
+MAX_ALL_ROWS = 100
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
+# --- COLOR SCHEME (Modern Design System) ---
+class Colors:
+    PRIMARY = "#3B82F6"      # Blue
+    SUCCESS = "#10B981"      # Emerald
+    WARNING = "#F59E0B"      # Amber
+    DANGER = "#EF4444"       # Red
+    INFO = "#06B6D4"         # Cyan
+    SECONDARY = "#6366F1"    # Indigo
+
+    BG_DARK = "#0F172A"      # Slate 900
+    BG_MEDIUM = "#1E293B"    # Slate 800
+    BG_LIGHT = "#334155"     # Slate 700
+
+    TEXT_PRIMARY = "#F1F5F9" # Slate 100
+    TEXT_SECONDARY = "#94A3B8"# Slate 400
+    TEXT_MUTED = "#64748B"   # Slate 500
+
+
 class ModernCANApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("CAN Analyzer Pro v4.1 - Ultimate Hybrid")
-        self.geometry("1650x800")
+        self.title("CAN Sniffer")
+        self.geometry("1800x900")
+        self.minsize(1400, 700)
 
-        # Struktury danych
-        self.can_rows = {}  # Dla widoku Grouped
-        self.all_msgs_widgets = []  # Dla widoku All Messages
+        # Data structures
+        self.can_rows: Dict = {}
+        self.all_msgs_widgets: List = []
+        self.can_queue = queue.Queue()
+        self.session_log: List = []
 
-        # Ładowanie baz danych
+        # Statistics
+        self.stats = {
+            'total_frames': 0,
+            'frames_per_id': {},
+            'start_time': None,
+            'last_update': datetime.now()
+        }
+
+        # Load databases
         self.id_labels = self._load_db(DB_IDS)
         self.function_labels = self._load_db(DB_FUNCTIONS)
 
+        self.message_queue = []
+        self.is_queue_running = False
+
+        # Counters
         self.row_counter_grouped = 1
         self.row_counter_all = 1
 
-        # Stan połączenia
-        self.ser = None
+        # Connection state
+        self.ser: Optional[serial.Serial] = None
         self.is_sniffing = False
         self.is_sending_active = False
         self.is_paused = False
 
-        self._build_ui()
-        self._update_tx_list()
+        # Filter state
+        self.filter_id = ""
 
-    def _load_db(self, path):
+        # ADD THIS:
+        self.sort_newest_first = False  # False = oldest first (default), True = newest first
+
+
+        self._build_modern_ui()
+        self._update_tx_list()
+        self.after(10, self._process_queue)
+        self.after(1000, self._update_stats_display)
+
+    def _load_db(self, path: str) -> Dict:
+        """Load JSON database with error handling"""
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
+            except Exception as e:
+                print(f"Error loading {path}: {e}")
                 return {}
         return {}
 
-    def _save_db(self, path, data):
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+    def _save_db(self, path: str, data: Dict):
+        """Save JSON database"""
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save {path}:\n{str(e)}")
 
-    def _build_ui(self):
+    def _build_modern_ui(self):
+        """Build modern, clean UI with better layout"""
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # --- SIDEBAR ---
-        self.sidebar = ctk.CTkFrame(self, width=250)
-        self.sidebar.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        # ===== LEFT SIDEBAR =====
+        self.sidebar = ctk.CTkFrame(self, width=280, fg_color=Colors.BG_DARK, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_propagate(False)
 
-        # 1. TRYB WIDOKU
-        ctk.CTkLabel(self.sidebar, text="TRYB WIDOKU", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 5))
-        self.view_mode = ctk.StringVar(value="Grouped Messages")
-        self.seg_view = ctk.CTkSegmentedButton(self.sidebar, values=["Grouped Messages", "All Messages"],
-                                               command=self.toggle_view_mode, variable=self.view_mode)
-        self.seg_view.pack(pady=5, padx=10)
+        # Header with logo/title
+        header = ctk.CTkFrame(self.sidebar, fg_color=Colors.PRIMARY, corner_radius=0, height=70)
+        header.pack(fill="x", pady=(0, 20))
+        header.pack_propagate(False)
 
-        # 2. KONFIGURACJA
-        ctk.CTkLabel(self.sidebar, text="KONFIGURACJA", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
-        self.port_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.port_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(
+            header,
+            text="⚡ CAN Sniffer",
+            font=ctk.CTkFont(size=24, weight="bold"),
+            text_color="white"
+        ).pack(pady=15)
 
-        self.port_combo = ctk.CTkComboBox(self.port_frame, width=150)
-        self.port_combo.pack(side="left", padx=(0, 5))
-        self.btn_refresh = ctk.CTkButton(self.port_frame, text="⟳", width=30, command=self.refresh_ports,
-                                         fg_color="#F39C12")
-        self.btn_refresh.pack(side="left")
+        # Connection Section
+        self._build_connection_section()
+
+        # Separator
+        ctk.CTkFrame(self.sidebar, height=2, fg_color=Colors.BG_LIGHT).pack(fill="x", padx=20, pady=15)
+
+        # Controls Section
+        self._build_controls_section()
+
+        # Separator
+        ctk.CTkFrame(self.sidebar, height=2, fg_color=Colors.BG_LIGHT).pack(fill="x", padx=20, pady=15)
+
+        # Tools Section
+        self._build_tools_section()
+
+        # Status at bottom
+        self.status_frame = ctk.CTkFrame(self.sidebar, fg_color=Colors.BG_MEDIUM, corner_radius=8)
+        self.status_frame.pack(side="bottom", fill="x", padx=15, pady=15)
+
+        self.status_lbl = ctk.CTkLabel(
+            self.status_frame,
+            text="● DISCONNECTED",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=Colors.TEXT_MUTED
+        )
+        self.status_lbl.pack(pady=12)
+
+        self.stats_lbl = ctk.CTkLabel(
+            self.status_frame,
+            text="0 frames | 0 fps",
+            font=ctk.CTkFont(size=11),
+            text_color=Colors.TEXT_SECONDARY
+        )
+        self.stats_lbl.pack(pady=(0, 10))
+
+        # ===== MAIN CONTENT AREA =====
+        self.main_content = ctk.CTkFrame(self, fg_color=Colors.BG_MEDIUM, corner_radius=0)
+        self.main_content.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
+        self.main_content.grid_rowconfigure(1, weight=1)
+        self.main_content.grid_columnconfigure(0, weight=1)
+
+        # Top bar with tabs and controls
+        self._build_top_bar()
+
+        # Content frames
+        self._build_content_frames()
+
+        # ===== STATUS BAR AT BOTTOM =====
+        self.status_bar = ctk.CTkFrame(self.main_content, fg_color=Colors.BG_DARK, height=35, corner_radius=0)
+        self.status_bar.grid(row=2, column=0, sticky="ew", padx=0, pady=0)
+        self.status_bar.grid_propagate(False)
+
+        self.status_message = ctk.CTkLabel(
+            self.status_bar,
+            text="Ready",
+            font=ctk.CTkFont(size=11),
+            text_color=Colors.TEXT_SECONDARY,
+            anchor="w"
+        )
+        self.status_message.pack(side="left", padx=15, pady=8)
+
+    def _show_status(self, message: str, duration: int = 3000, color: str = Colors.TEXT_SECONDARY):
+        """Show a temporary status message in the status bar"""
+        self.status_message.configure(text=message, text_color=color)
+
+        # Auto-clear after duration
+        def clear_status():
+            try:
+                if self.status_message.cget("text") == message:  # Only clear if message hasn't changed
+                    self.status_message.configure(text="Ready", text_color=Colors.TEXT_SECONDARY)
+            except:
+                pass
+
+        self.after(duration, clear_status)
+
+    def _build_connection_section(self):
+        """Build connection controls"""
+        section = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        section.pack(fill="x", padx=15, pady=5)
+
+        ctk.CTkLabel(
+            section,
+            text="CONNECTION",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=Colors.TEXT_SECONDARY
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Port selection
+        port_frame = ctk.CTkFrame(section, fg_color=Colors.BG_MEDIUM, corner_radius=8)
+        port_frame.pack(fill="x", pady=(0, 10))
+
+        self.port_combo = ctk.CTkComboBox(
+            port_frame,
+            width=180,
+            fg_color=Colors.BG_LIGHT,
+            border_color=Colors.BG_LIGHT,
+            button_color=Colors.PRIMARY,
+            button_hover_color=Colors.SECONDARY
+        )
+        self.port_combo.pack(side="left", padx=10, pady=10)
+
+        self.btn_refresh = ctk.CTkButton(
+            port_frame,
+            text="↻",
+            width=35,
+            height=35,
+            command=self.refresh_ports,
+            fg_color=Colors.INFO,
+            hover_color="#0891B2",
+            corner_radius=8
+        )
+        self.btn_refresh.pack(side="left", padx=(0, 10), pady=10)
+
         self.refresh_ports()
 
-        self.btn_connect = ctk.CTkButton(self.sidebar, text="POŁĄCZ", fg_color="green", command=self.toggle_connection)
-        self.btn_connect.pack(pady=(10, 5), padx=10)
+        # Connect button
+        self.btn_connect = ctk.CTkButton(
+            section,
+            text="CONNECT",
+            command=self.toggle_connection,
+            fg_color=Colors.SUCCESS,
+            hover_color="#059669",
+            height=40,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            corner_radius=8
+        )
+        self.btn_connect.pack(fill="x", pady=(0, 10))
 
-        # Przycisk PAUZA
-        self.btn_pause = ctk.CTkButton(self.sidebar, text="PAUZA (ZAMROŹ)", fg_color="#E67E22", state="disabled",
-                                       command=self.toggle_pause)
-        self.btn_pause.pack(pady=5, padx=10)
+        # Pause button
+        self.btn_pause = ctk.CTkButton(
+            section,
+            text="⏸ PAUSE",
+            command=self.toggle_pause,
+            fg_color=Colors.WARNING,
+            hover_color="#D97706",
+            height=36,
+            state="disabled",
+            corner_radius=8
+        )
+        self.btn_pause.pack(fill="x")
 
-        # 3. NADAWANIE (TX)
-        ctk.CTkLabel(self.sidebar, text="NADAWANIE (TX)", font=ctk.CTkFont(weight="bold")).pack(pady=(20, 5))
-        self.tx_combo = ctk.CTkComboBox(self.sidebar, values=["Brak funkcji"], width=220)
-        self.tx_combo.pack(pady=5, padx=10)
+    def _build_controls_section(self):
+        """Build transmission controls"""
+        section = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        section.pack(fill="x", padx=15, pady=5)
 
-        self.tx_settings_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.tx_settings_frame.pack(pady=5, padx=10, fill="x")
-        ctk.CTkLabel(self.tx_settings_frame, text="Ilość:", font=("Arial", 11)).grid(row=0, column=0, padx=2,
-                                                                                     sticky="w")
-        self.entry_repeat = ctk.CTkEntry(self.tx_settings_frame, width=60)
-        self.entry_repeat.grid(row=0, column=1, padx=2)
-        self.entry_repeat.insert(0, "1")
-        ctk.CTkLabel(self.tx_settings_frame, text="Odstęp (ms):", font=("Arial", 11)).grid(row=1, column=0, padx=2,
-                                                                                           sticky="w", pady=(5, 0))
-        self.entry_interval = ctk.CTkEntry(self.tx_settings_frame, width=60)
-        self.entry_interval.grid(row=1, column=1, padx=2, pady=(5, 0))
-        self.entry_interval.insert(0, "100")
-        self.btn_send = ctk.CTkButton(self.sidebar, text="WYŚLIJ ROZKAZ", fg_color="#D35400",
-                                      command=self.handle_send_click)
-        self.btn_send.pack(pady=15, padx=10)
+        ctk.CTkLabel(
+            section,
+            text="TRANSMIT",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=Colors.TEXT_SECONDARY
+        ).pack(anchor="w", pady=(0, 10))
 
-        # 4. ZARZĄDZANIE BAZĄ (Restore functionality)
-        ctk.CTkLabel(self.sidebar, text="BAZY DANYCH", font=ctk.CTkFont(weight="bold")).pack(pady=(20, 5))
-        ctk.CTkButton(self.sidebar, text="Zarządzaj ID", command=self.win_manage_ids).pack(pady=5, padx=10)
-        ctk.CTkButton(self.sidebar, text="Zarządzaj Funkcjami", command=self.win_manage_funcs).pack(pady=5, padx=10)
+        # Quick send frame
+        quick_frame = ctk.CTkFrame(section, fg_color=Colors.BG_MEDIUM, corner_radius=8)
+        quick_frame.pack(fill="x", pady=(0, 10))
+        quick_frame.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkButton(self.sidebar, text="Wyczyść Monitor", fg_color="#C0392B", command=self._clear_monitor).pack(
-            pady=(30, 5), padx=10)
-        self.status_lbl = ctk.CTkLabel(self.sidebar, text="STATUS: ROZŁĄCZONY", text_color="gray")
-        self.status_lbl.pack(pady=20)
+        ctk.CTkLabel(quick_frame, text="Quick Send:", text_color=Colors.TEXT_SECONDARY).grid(
+            row=0, column=0, columnspan=2, padx=10, pady=(8, 5), sticky="w"
+        )
 
-        # --- WIDOK 1: GROUPED ---
-        self.scroll_grouped = ctk.CTkScrollableFrame(self, label_text="Grouped Messages (Unique ID)")
-        self.scroll_grouped.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
-        headers_grouped = ["ID", "Urządzenie", "Funkcja", "RTR", "IDE", "DLC", "D0", "D1", "D2", "D3", "D4", "D5", "D6",
-                           "D7", "Zapis"]
-        for i, h in enumerate(headers_grouped):
-            ctk.CTkLabel(self.scroll_grouped, text=h, font=ctk.CTkFont(weight="bold"), width=50).grid(row=0, column=i,
-                                                                                                      padx=5, pady=5)
+        self.tx_combo = ctk.CTkComboBox(
+            quick_frame,
+            values=["No functions saved"],
+            fg_color=Colors.BG_LIGHT,
+            border_color=Colors.BG_LIGHT,
+            button_color=Colors.PRIMARY,
+            corner_radius=8
+        )
+        self.tx_combo.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky="ew")
 
-        # --- WIDOK 2: ALL MESSAGES ---
-        self.scroll_all = ctk.CTkScrollableFrame(self, label_text="All Messages Stream (Buffer: 100)")
-        headers_all = ["ID", "Urządzenie", "Funkcja", "RTR", "IDE", "DLC", "D0", "D1", "D2", "D3", "D4", "D5", "D6",
-                       "D7", "Czas"]
-        for i, h in enumerate(headers_all):
-            ctk.CTkLabel(self.scroll_all, text=h, font=ctk.CTkFont(weight="bold"), width=50).grid(row=0, column=i,
-                                                                                                  padx=5, pady=5)
+        ctk.CTkButton(
+            quick_frame,
+            text="Send Once",
+            command=self.send_once,
+            fg_color=Colors.SECONDARY,
+            hover_color="#4F46E5",
+            height=32
+        ).grid(row=2, column=0, padx=(10, 5), pady=(5, 10), sticky="ew")
 
-    # --- LOGIKA UI ---
-    def toggle_view_mode(self, value):
-        if value == "Grouped Messages":
+        ctk.CTkButton(
+            quick_frame,
+            text="Add to Queue",
+            command=self.add_to_queue,
+            fg_color=Colors.INFO,
+            hover_color="#0891B2",
+            height=32
+        ).grid(row=2, column=1, padx=(5, 10), pady=(5, 10), sticky="ew")
+
+        # Queue management
+        ctk.CTkButton(
+            section,
+            text="📋 Manage Queue",
+            command=self.open_queue_manager,
+            fg_color=Colors.PRIMARY,
+            hover_color=Colors.SECONDARY,
+            height=40,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            corner_radius=8
+        ).pack(fill="x")
+
+    def _build_tools_section(self):
+        """Build tools section"""
+        section = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        section.pack(fill="x", padx=15, pady=5)
+
+        ctk.CTkLabel(
+            section,
+            text="TOOLS",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=Colors.TEXT_SECONDARY
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Tool buttons
+        tools = [
+            ("📊 Statistics", self.show_statistics, Colors.SECONDARY),
+            ("💾 Export CSV", self.export_session_log, Colors.INFO),
+            ("🏷️ Manage IDs", self.win_manage_ids, Colors.PRIMARY),
+            ("⚙️ Manage Functions", self.win_manage_funcs, Colors.PRIMARY),
+            ("🗑️ Clear Monitor", self._clear_monitor, Colors.DANGER),
+        ]
+
+        for text, command, color in tools:
+            ctk.CTkButton(
+                section,
+                text=text,
+                command=command,
+                fg_color=color,
+                hover_color=self._darken_color(color),
+                height=36,
+                corner_radius=8,
+                anchor="w",
+                font=ctk.CTkFont(size=12)
+            ).pack(fill="x", pady=3)
+
+    def _build_top_bar(self):
+        """Build top bar with tabs and filter"""
+        top_bar = ctk.CTkFrame(self.main_content, fg_color=Colors.BG_DARK, height=60, corner_radius=0)
+        top_bar.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        top_bar.grid_propagate(False)
+
+        # View mode tabs
+        self.view_mode = ctk.StringVar(value="Grouped")
+        self.seg_view = ctk.CTkSegmentedButton(
+            top_bar,
+            values=["Grouped", "Stream"],
+            command=self.toggle_view_mode,
+            variable=self.view_mode,
+            fg_color=Colors.BG_MEDIUM,
+            selected_color=Colors.PRIMARY,
+            selected_hover_color=Colors.SECONDARY,
+            unselected_color=Colors.BG_LIGHT,
+            unselected_hover_color=Colors.BG_MEDIUM
+        )
+        self.seg_view.pack(side="left", padx=20, pady=15)
+
+        # ADD SORT BUTTON HERE (between tabs and filters):
+        self.btn_sort = ctk.CTkButton(
+            top_bar,
+            text="▼ Oldest First",
+            width=130,
+            command=self.toggle_sort_order,
+            fg_color=Colors.INFO,
+            hover_color="#0891B2",
+            corner_radius=8
+        )
+        self.btn_sort.pack(side="left", padx=(0, 20), pady=15)
+
+        # Filter controls
+        filter_frame = ctk.CTkFrame(top_bar, fg_color="transparent")
+        filter_frame.pack(side="right", padx=20, pady=15)
+
+        ctk.CTkLabel(filter_frame, text="🔍", font=ctk.CTkFont(size=16)).pack(side="left", padx=(0, 5))
+
+        # ID Filter
+        self.filter_entry = ctk.CTkEntry(
+            filter_frame,
+            placeholder_text="Filter by ID...",
+            width=120,
+            fg_color=Colors.BG_MEDIUM,
+            border_color=Colors.BG_LIGHT
+        )
+        self.filter_entry.pack(side="left", padx=5)
+
+        # Advanced filters button
+        ctk.CTkButton(
+            filter_frame,
+            text="⚙ Filters",
+            width=80,
+            command=self._open_advanced_filters,
+            fg_color=Colors.SECONDARY,
+            hover_color="#4F46E5"
+        ).pack(side="left", padx=5)
+
+    def toggle_sort_order(self):
+        """Toggle between newest first and oldest first"""
+        self.sort_newest_first = not self.sort_newest_first
+
+        if self.sort_newest_first:
+            self.btn_sort.configure(text="▲ Newest First")
+        else:
+            self.btn_sort.configure(text="▼ Oldest First")
+
+        # Rebuild current view
+        current_mode = self.view_mode.get()
+        if current_mode == "Grouped":
+            self._rebuild_grouped_view()
+        else:
+            self._rebuild_stream_view()
+
+    def _rebuild_grouped_view(self):
+        """Rebuild grouped view with current sort order"""
+        # Store current data
+        stored_rows = {}
+        for can_id, row_data in self.can_rows.items():
+            stored_rows[can_id] = {
+                'last_data': row_data['last_data'].copy(),
+                'dev_name': row_data['dev_lbl'].cget("text"),
+                'func_name': row_data['func_lbl'].cget("text")
+            }
+
+        # Clear display
+        for r in self.can_rows.values():
+            for w in r['widgets']:
+                try:
+                    w.destroy()
+                except:
+                    pass
+        self.can_rows.clear()
+
+        # Sort IDs
+        sorted_ids = sorted(stored_rows.keys())
+        if self.sort_newest_first:
+            sorted_ids = reversed(sorted_ids)
+
+        # Rebuild in new order
+        self.row_counter_grouped = 1
+        for can_id in sorted_ids:
+            data = stored_rows[can_id]
+            dev_name = data['dev_name']
+            func_name = data['func_name']
+            bytes_list = data['last_data']
+
+            # Create row (same as in _update_grouped_view for new rows)
+            row = self.row_counter_grouped
+            self.row_counter_grouped += 1
+            bg = Colors.BG_DARK  # No highlight on rebuild
+
+            id_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=can_id,
+                text_color=Colors.PRIMARY,
+                cursor="hand2",
+                width=80,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11, weight="bold")
+            )
+            id_l.grid(row=row, column=0, padx=8, pady=4, sticky="ew")
+            id_l.bind("<Button-1>", lambda e, cid=can_id: self._open_id_edit(cid))
+
+            dev_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=dev_name,
+                text_color=Colors.SUCCESS if dev_name != "Unknown" else Colors.TEXT_MUTED,
+                width=120,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11)
+            )
+            dev_l.grid(row=row, column=1, padx=8, pady=4, sticky="ew")
+
+            func_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=func_name,
+                text_color=Colors.WARNING if func_name != "---" else Colors.TEXT_MUTED,
+                width=150,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11)
+            )
+            func_l.grid(row=row, column=2, padx=8, pady=4, sticky="ew")
+
+            # RTR, IDE, DLC (get from last_data or use defaults)
+            rtr_l = ctk.CTkLabel(self.scroll_grouped, text="0", text_color=Colors.TEXT_SECONDARY, width=40, fg_color=bg,
+                                 font=ctk.CTkFont(size=11))
+            rtr_l.grid(row=row, column=3, padx=8, pady=4, sticky="ew")
+
+            ide_l = ctk.CTkLabel(self.scroll_grouped, text="0", text_color=Colors.TEXT_SECONDARY, width=40, fg_color=bg,
+                                 font=ctk.CTkFont(size=11))
+            ide_l.grid(row=row, column=4, padx=8, pady=4, sticky="ew")
+
+            dlc_l = ctk.CTkLabel(self.scroll_grouped, text="8", text_color=Colors.TEXT_SECONDARY, width=40, fg_color=bg,
+                                 font=ctk.CTkFont(size=11))
+            dlc_l.grid(row=row, column=5, padx=8, pady=4, sticky="ew")
+
+            # Data bytes
+            b_labels = []
+            for j in range(8):
+                val = bytes_list[j] if j < len(bytes_list) else "00"
+                color = Colors.DANGER if val != "00" else Colors.TEXT_MUTED
+                l = ctk.CTkLabel(
+                    self.scroll_grouped,
+                    text=val,
+                    text_color=color,
+                    width=50,
+                    fg_color=bg,
+                    font=ctk.CTkFont(size=11)
+                )
+                l.grid(row=row, column=6 + j, padx=4, pady=4, sticky="ew")
+                b_labels.append(l)
+
+            btn = ctk.CTkButton(
+                self.scroll_grouped,
+                text="+",
+                width=35,
+                height=28,
+                command=lambda cid=can_id: self._save_function(cid),
+                fg_color=Colors.SUCCESS,
+                hover_color="#059669",
+                corner_radius=6,
+                font=ctk.CTkFont(size=14, weight="bold")
+            )
+            btn.grid(row=row, column=14, padx=8, pady=4)
+
+            widgets = [id_l, dev_l, func_l, rtr_l, ide_l, dlc_l] + b_labels
+            self.can_rows[can_id] = {
+                'dev_lbl': dev_l,
+                'func_lbl': func_l,
+                'bytes': b_labels,
+                'last_data': bytes_list.copy(),
+                'widgets': widgets + [btn],
+                'bg': bg
+            }
+
+    def _rebuild_stream_view(self):
+        """Rebuild stream view with current sort order"""
+        # Store current messages
+        stored_messages = []
+        for widgets in self.all_msgs_widgets:
+            if len(widgets) >= 15:  # Ensure we have all widgets
+                try:
+                    msg_data = {
+                        'id': widgets[0].cget("text"),
+                        'device': widgets[1].cget("text"),
+                        'function': widgets[2].cget("text"),
+                        'rtr': widgets[3].cget("text"),
+                        'ide': widgets[4].cget("text"),
+                        'dlc': widgets[5].cget("text"),
+                        'bytes': [widgets[6 + i].cget("text") for i in range(8)],
+                        'time': widgets[14].cget("text")
+                    }
+                    stored_messages.append(msg_data)
+                except:
+                    pass
+
+        # Clear display
+        for row_widgets in self.all_msgs_widgets:
+            for w in row_widgets:
+                try:
+                    w.destroy()
+                except:
+                    pass
+        self.all_msgs_widgets.clear()
+
+        # Reverse if newest first
+        if self.sort_newest_first:
+            stored_messages = list(reversed(stored_messages))
+
+        # Rebuild
+        self.row_counter_all = 1
+        for msg in stored_messages:
+            row = self.row_counter_all
+            self.row_counter_all += 1
+            bg = Colors.BG_MEDIUM if row % 2 == 0 else Colors.BG_DARK
+
+            widgets = []
+
+            def add_lbl(txt, col, color=Colors.TEXT_PRIMARY, width=50):
+                l = ctk.CTkLabel(
+                    self.scroll_all,
+                    text=txt,
+                    fg_color=bg,
+                    text_color=color,
+                    width=width,
+                    anchor="w",
+                    font=ctk.CTkFont(size=11)
+                )
+                l.grid(row=row, column=col, padx=4, pady=1, sticky="ew")
+                widgets.append(l)
+
+            add_lbl(msg['id'], 0, Colors.PRIMARY, 80)
+            add_lbl(msg['device'], 1, Colors.SUCCESS if msg['device'] != "Unknown" else Colors.TEXT_MUTED, 120)
+            add_lbl(msg['function'], 2, Colors.WARNING if msg['function'] != "---" else Colors.TEXT_MUTED, 150)
+            add_lbl(msg['rtr'], 3, Colors.TEXT_SECONDARY, 40)
+            add_lbl(msg['ide'], 4, Colors.TEXT_SECONDARY, 40)
+            add_lbl(msg['dlc'], 5, Colors.TEXT_SECONDARY, 40)
+
+            for j in range(8):
+                val = msg['bytes'][j]
+                color = Colors.DANGER if val != "00" else Colors.TEXT_MUTED
+                add_lbl(val, 6 + j, color, 40)
+
+            add_lbl(msg['time'], 14, Colors.TEXT_MUTED, 80)
+
+            # Add save button
+            data_str = " ".join(msg['bytes'])
+            btn = ctk.CTkButton(
+                self.scroll_all,
+                text="+",
+                width=30,
+                height=24,
+                command=lambda cid=msg['id'], ds=data_str: self._save_function_stream(cid, ds),
+                fg_color=Colors.SUCCESS,
+                hover_color="#059669",
+                corner_radius=6,
+                font=ctk.CTkFont(size=12, weight="bold")
+            )
+            btn.grid(row=row, column=15, padx=4, pady=1)
+            widgets.append(btn)
+
+            self.all_msgs_widgets.append(widgets)
+
+    def _open_advanced_filters(self):
+        """Open advanced filtering options"""
+        win = ctk.CTkToplevel(self)
+        win.title("Advanced Filters")
+        win.geometry("400x450")
+        win.attributes("-topmost", True)
+        win.configure(fg_color=Colors.BG_DARK)
+
+        # Initialize filter settings if not exists
+        if not hasattr(self, 'filter_settings'):
+            self.filter_settings = {
+                'hide_periodic': False,
+                'hide_zero_data': False,
+                'show_only_changed': False,
+                'min_dlc': 0,
+                'max_dlc': 8,
+                'id_whitelist': [],
+                'id_blacklist': []
+            }
+
+        main_frame = ctk.CTkFrame(win, fg_color=Colors.BG_DARK)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(
+            main_frame,
+            text="Filter Options",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=Colors.TEXT_PRIMARY
+        ).pack(pady=(0, 20))
+
+        # Checkboxes for quick filters
+        self.hide_periodic_var = ctk.BooleanVar(value=self.filter_settings['hide_periodic'])
+        ctk.CTkCheckBox(
+            main_frame,
+            text="Hide periodic messages (heartbeats)",
+            variable=self.hide_periodic_var,
+            fg_color=Colors.PRIMARY,
+            hover_color=Colors.SECONDARY
+        ).pack(anchor="w", pady=5)
+
+        self.hide_zero_var = ctk.BooleanVar(value=self.filter_settings['hide_zero_data'])
+        ctk.CTkCheckBox(
+            main_frame,
+            text="Hide messages with all-zero data",
+            variable=self.hide_zero_var,
+            fg_color=Colors.PRIMARY,
+            hover_color=Colors.SECONDARY
+        ).pack(anchor="w", pady=5)
+
+        self.show_changed_var = ctk.BooleanVar(value=self.filter_settings['show_only_changed'])
+        ctk.CTkCheckBox(
+            main_frame,
+            text="Show only messages that changed recently",
+            variable=self.show_changed_var,
+            fg_color=Colors.PRIMARY,
+            hover_color=Colors.SECONDARY
+        ).pack(anchor="w", pady=5)
+
+        # DLC Range
+        ctk.CTkLabel(main_frame, text="DLC Range:", text_color=Colors.TEXT_SECONDARY).pack(anchor="w", pady=(15, 5))
+
+        dlc_frame = ctk.CTkFrame(main_frame, fg_color=Colors.BG_MEDIUM)
+        dlc_frame.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(dlc_frame, text="Min:").pack(side="left", padx=(10, 5))
+        self.min_dlc_entry = ctk.CTkEntry(dlc_frame, width=50, fg_color=Colors.BG_LIGHT)
+        self.min_dlc_entry.insert(0, str(self.filter_settings['min_dlc']))
+        self.min_dlc_entry.pack(side="left", padx=5)
+
+        ctk.CTkLabel(dlc_frame, text="Max:").pack(side="left", padx=(20, 5))
+        self.max_dlc_entry = ctk.CTkEntry(dlc_frame, width=50, fg_color=Colors.BG_LIGHT)
+        self.max_dlc_entry.insert(0, str(self.filter_settings['max_dlc']))
+        self.max_dlc_entry.pack(side="left", padx=5)
+
+        # ID Lists
+        ctk.CTkLabel(main_frame, text="Whitelist IDs (comma-separated):",
+                     text_color=Colors.TEXT_SECONDARY).pack(anchor="w", pady=(15, 5))
+        self.whitelist_entry = ctk.CTkEntry(main_frame, fg_color=Colors.BG_MEDIUM)
+        self.whitelist_entry.insert(0, ",".join(self.filter_settings['id_whitelist']))
+        self.whitelist_entry.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(main_frame, text="Blacklist IDs (comma-separated):",
+                     text_color=Colors.TEXT_SECONDARY).pack(anchor="w", pady=(15, 5))
+        self.blacklist_entry = ctk.CTkEntry(main_frame, fg_color=Colors.BG_MEDIUM)
+        self.blacklist_entry.insert(0, ",".join(self.filter_settings['id_blacklist']))
+        self.blacklist_entry.pack(fill="x", pady=5)
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        btn_frame.pack(pady=(20, 0))
+
+        def apply_filters():
+            self.filter_settings['hide_periodic'] = self.hide_periodic_var.get()
+            self.filter_settings['hide_zero_data'] = self.hide_zero_var.get()
+            self.filter_settings['show_only_changed'] = self.show_changed_var.get()
+
+            try:
+                self.filter_settings['min_dlc'] = int(self.min_dlc_entry.get())
+                self.filter_settings['max_dlc'] = int(self.max_dlc_entry.get())
+            except:
+                pass
+
+            whitelist = self.whitelist_entry.get().strip()
+            self.filter_settings['id_whitelist'] = [x.strip().upper() for x in whitelist.split(",") if x.strip()]
+
+            blacklist = self.blacklist_entry.get().strip()
+            self.filter_settings['id_blacklist'] = [x.strip().upper() for x in blacklist.split(",") if x.strip()]
+
+            self._show_status("✓ Filters applied", 3000, Colors.SUCCESS)
+            win.destroy()
+
+        def reset_filters():
+            self.filter_settings = {
+                'hide_periodic': False,
+                'hide_zero_data': False,
+                'show_only_changed': False,
+                'min_dlc': 0,
+                'max_dlc': 8,
+                'id_whitelist': [],
+                'id_blacklist': []
+            }
+            self._show_status("✓ Filters reset", 3000, Colors.INFO)
+            win.destroy()
+
+        ctk.CTkButton(btn_frame, text="Apply", command=apply_filters,
+                      fg_color=Colors.SUCCESS, width=120).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Reset", command=reset_filters,
+                      fg_color=Colors.DANGER, width=120).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=win.destroy,
+                      fg_color=Colors.BG_LIGHT, width=120).pack(side="left", padx=5)
+
+    def send_once(self):
+        """Send selected message once"""
+        if not self.ser or not self.ser.is_open:
+            self._show_status("⚠ No connection!", 3000, Colors.WARNING)
+            return
+
+        selection = self.tx_combo.get()
+        if not selection or selection == "No functions saved":
+            return
+
+        target_id = selection.split("]")[0].replace("[", "")
+        data_to_send = None
+
+        if target_id in self.function_labels:
+            mappings = self.function_labels[target_id].get("mappings", {})
+            for d_str, f_name in mappings.items():
+                if f"[{target_id}] {f_name}" in selection:
+                    data_to_send = d_str
+                    break
+
+        if data_to_send:
+            command = f"SEND:{target_id}|{data_to_send}\n"
+            try:
+                self.ser.write(command.encode('utf-8'))
+                self._show_status(f"✓ Sent: {target_id}", 2000, Colors.SUCCESS)
+            except Exception as e:
+                self._show_status(f"✗ Send failed: {e}", 3000, Colors.DANGER)
+
+    def add_to_queue(self):
+        """Add selected message to queue with custom parameters"""
+        selection = self.tx_combo.get()
+        if not selection or selection == "No functions saved":
+            return
+
+        target_id = selection.split("]")[0].replace("[", "")
+        data_to_send = None
+        func_name = ""
+
+        if target_id in self.function_labels:
+            mappings = self.function_labels[target_id].get("mappings", {})
+            for d_str, f_name in mappings.items():
+                if f"[{target_id}] {f_name}" in selection:
+                    data_to_send = d_str
+                    func_name = f_name
+                    break
+
+        if data_to_send:
+            # Create dialog for parameters
+            dialog = ctk.CTkToplevel(self)
+            dialog.title("Add to Queue")
+            dialog.geometry("350x300")
+            dialog.attributes("-topmost", True)
+            dialog.configure(fg_color=Colors.BG_DARK)
+            dialog.grab_set()
+
+            main_frame = ctk.CTkFrame(dialog, fg_color=Colors.BG_DARK)
+            main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+            ctk.CTkLabel(
+                main_frame,
+                text=f"Add: [{target_id}] {func_name}",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color=Colors.PRIMARY
+            ).pack(pady=(0, 20))
+
+            # Repeat count
+            ctk.CTkLabel(main_frame, text="Repeat count:", text_color=Colors.TEXT_SECONDARY).pack(anchor="w",
+                                                                                                  pady=(0, 5))
+            repeat_entry = ctk.CTkEntry(main_frame, fg_color=Colors.BG_MEDIUM)
+            repeat_entry.insert(0, "1")
+            repeat_entry.pack(fill="x", pady=(0, 15))
+
+            # Delay
+            ctk.CTkLabel(main_frame, text="Delay between repeats (ms):", text_color=Colors.TEXT_SECONDARY).pack(
+                anchor="w", pady=(0, 5))
+            delay_entry = ctk.CTkEntry(main_frame, fg_color=Colors.BG_MEDIUM)
+            delay_entry.insert(0, "100")
+            delay_entry.pack(fill="x", pady=(0, 20))
+
+            def add():
+                try:
+                    repeat = int(repeat_entry.get())
+                    delay = int(delay_entry.get())
+
+                    self.message_queue.append({
+                        'id': target_id,
+                        'data': data_to_send,
+                        'name': func_name,
+                        'repeat': repeat,
+                        'delay': delay
+                    })
+                    self._show_status(f"✓ Added to queue: {func_name}", 2000, Colors.SUCCESS)
+                    dialog.destroy()
+                except ValueError:
+                    self._show_status("✗ Invalid numbers!", 3000, Colors.DANGER)
+
+            btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+            btn_frame.pack()
+
+            ctk.CTkButton(btn_frame, text="Add", command=add, fg_color=Colors.SUCCESS, width=120).pack(side="left",
+                                                                                                       padx=5)
+            ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, fg_color=Colors.BG_LIGHT, width=120).pack(
+                side="left", padx=5)
+
+    def open_queue_manager(self):
+        """Open queue management window"""
+        win = ctk.CTkToplevel(self)
+        win.title("Message Queue")
+        win.geometry("700x500")
+        win.attributes("-topmost", True)
+        win.configure(fg_color=Colors.BG_DARK)
+
+        main_frame = ctk.CTkFrame(win, fg_color=Colors.BG_DARK)
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        # Header
+        header = ctk.CTkFrame(main_frame, fg_color=Colors.BG_MEDIUM)
+        header.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(
+            header,
+            text=f"Message Queue ({len(self.message_queue)} messages)",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(pady=10)
+
+        # Queue list
+        list_frame = ctk.CTkScrollableFrame(main_frame, fg_color=Colors.BG_MEDIUM)
+        list_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        def refresh_queue():
+            for widget in list_frame.winfo_children():
+                widget.destroy()
+
+            if not self.message_queue:
+                ctk.CTkLabel(
+                    list_frame,
+                    text="Queue is empty",
+                    text_color=Colors.TEXT_MUTED
+                ).pack(pady=20)
+                return
+
+            for idx, msg in enumerate(self.message_queue):
+                msg_frame = ctk.CTkFrame(list_frame, fg_color=Colors.BG_DARK, corner_radius=8)
+                msg_frame.pack(fill="x", pady=5, padx=5)
+
+                # Message info
+                info_frame = ctk.CTkFrame(msg_frame, fg_color="transparent")
+                info_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+
+                ctk.CTkLabel(
+                    info_frame,
+                    text=f"#{idx + 1}: [{msg['id']}] {msg['name']}",
+                    font=ctk.CTkFont(weight="bold"),
+                    text_color=Colors.PRIMARY
+                ).pack(anchor="w")
+
+                ctk.CTkLabel(
+                    info_frame,
+                    text=f"Data: {msg['data']} | Repeat: {msg['repeat']}x | Delay: {msg['delay']}ms",
+                    text_color=Colors.TEXT_SECONDARY,
+                    font=ctk.CTkFont(size=10)
+                ).pack(anchor="w")
+
+                # Buttons
+                btn_frame = ctk.CTkFrame(msg_frame, fg_color="transparent")
+                btn_frame.pack(side="right", padx=10)
+
+                ctk.CTkButton(
+                    btn_frame,
+                    text="↑",
+                    width=30,
+                    command=lambda i=idx: move_up(i),
+                    fg_color=Colors.INFO
+                ).pack(side="left", padx=2)
+
+                ctk.CTkButton(
+                    btn_frame,
+                    text="↓",
+                    width=30,
+                    command=lambda i=idx: move_down(i),
+                    fg_color=Colors.INFO
+                ).pack(side="left", padx=2)
+
+                ctk.CTkButton(
+                    btn_frame,
+                    text="✎",
+                    width=30,
+                    command=lambda i=idx: edit_message(i),
+                    fg_color=Colors.WARNING
+                ).pack(side="left", padx=2)
+
+                ctk.CTkButton(
+                    btn_frame,
+                    text="✕",
+                    width=30,
+                    command=lambda i=idx: delete_message(i),
+                    fg_color=Colors.DANGER
+                ).pack(side="left", padx=2)
+
+        def move_up(idx):
+            if idx > 0:
+                self.message_queue[idx], self.message_queue[idx - 1] = \
+                    self.message_queue[idx - 1], self.message_queue[idx]
+                refresh_queue()
+
+        def move_down(idx):
+            if idx < len(self.message_queue) - 1:
+                self.message_queue[idx], self.message_queue[idx + 1] = \
+                    self.message_queue[idx + 1], self.message_queue[idx]
+                refresh_queue()
+
+        def delete_message(idx):
+            self.message_queue.pop(idx)
+            refresh_queue()
+
+        def edit_message(idx):
+            msg = self.message_queue[idx]
+            edit_win = ctk.CTkToplevel(win)
+            edit_win.title("Edit Message")
+            edit_win.geometry("350x200")
+            edit_win.configure(fg_color=Colors.BG_DARK)
+
+            ctk.CTkLabel(edit_win, text="Repeat count:").pack(pady=(20, 5))
+            repeat_entry = ctk.CTkEntry(edit_win)
+            repeat_entry.insert(0, str(msg['repeat']))
+            repeat_entry.pack(pady=5)
+
+            ctk.CTkLabel(edit_win, text="Delay (ms):").pack(pady=5)
+            delay_entry = ctk.CTkEntry(edit_win)
+            delay_entry.insert(0, str(msg['delay']))
+            delay_entry.pack(pady=5)
+
+            def save():
+                try:
+                    msg['repeat'] = int(repeat_entry.get())
+                    msg['delay'] = int(delay_entry.get())
+                    refresh_queue()
+                    edit_win.destroy()
+                except:
+                    pass
+
+            ctk.CTkButton(edit_win, text="Save", command=save, fg_color=Colors.SUCCESS).pack(pady=20)
+
+        refresh_queue()
+
+        # Control buttons
+        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        btn_frame.pack(fill="x")
+
+        self.queue_status_label = ctk.CTkLabel(
+            btn_frame,
+            text="Ready",
+            text_color=Colors.TEXT_SECONDARY
+        )
+        self.queue_status_label.pack(side="left", padx=10)
+
+        def run_queue():
+            if not self.ser or not self.ser.is_open:
+                self._show_status("⚠ No connection!", 3000, Colors.WARNING)
+                return
+
+            if not self.message_queue:
+                self._show_status("⚠ Queue is empty!", 3000, Colors.WARNING)
+                return
+
+            self.is_queue_running = True
+            threading.Thread(target=self._execute_queue, daemon=True).start()
+
+        def stop_queue():
+            self.is_queue_running = False
+
+        def clear_queue():
+            self.message_queue.clear()
+            refresh_queue()
+
+        ctk.CTkButton(
+            btn_frame,
+            text="▶ Run Queue",
+            command=run_queue,
+            fg_color=Colors.SUCCESS,
+            width=120
+        ).pack(side="right", padx=5)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="⏹ Stop",
+            command=stop_queue,
+            fg_color=Colors.DANGER,
+            width=100
+        ).pack(side="right", padx=5)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Clear All",
+            command=clear_queue,
+            fg_color=Colors.BG_LIGHT,
+            width=100
+        ).pack(side="right", padx=5)
+
+    def _execute_queue(self):
+        """Execute message queue in background thread"""
+        self.after(0, lambda: self._show_status("▶ Queue running...", 0, Colors.INFO))
+
+        for msg in self.message_queue:
+            if not self.is_queue_running or not self.is_sniffing:
+                break
+
+            for _ in range(msg['repeat']):
+                if not self.is_queue_running or not self.is_sniffing:
+                    break
+
+                command = f"SEND:{msg['id']}|{msg['data']}\n"
+                try:
+                    self.ser.write(command.encode('utf-8'))
+                except:
+                    break
+
+                time.sleep(msg['delay'] / 1000.0)
+
+        self.is_queue_running = False
+        self.after(0, lambda: self._show_status("✓ Queue completed", 3000, Colors.SUCCESS))
+
+    def _build_content_frames(self):
+        """Build content display frames"""
+        # Grouped view
+        self.scroll_grouped = ctk.CTkScrollableFrame(
+            self.main_content,
+            fg_color=Colors.BG_DARK,
+            corner_radius=0
+        )
+        self.scroll_grouped.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+
+        headers = ["ID", "Device", "Function", "RTR", "IDE", "DLC", "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", ""]
+
+        header_frame = ctk.CTkFrame(self.scroll_grouped, fg_color=Colors.BG_MEDIUM, corner_radius=0)
+        header_frame.grid(row=0, column=0, columnspan=15, sticky="ew", pady=(0, 2))
+
+        for i, h in enumerate(headers):
+            label = ctk.CTkLabel(
+                header_frame,
+                text=h,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=Colors.TEXT_SECONDARY,
+                width=50 if i >= 6 else 80
+            )
+            label.grid(row=0, column=i, padx=8, pady=10, sticky="w")
+
+        # Stream view
+        self.scroll_all = ctk.CTkScrollableFrame(
+            self.main_content,
+            fg_color=Colors.BG_DARK,
+            corner_radius=0
+        )
+
+        headers_stream = ["ID", "Device", "Function", "RTR", "IDE", "DLC", "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "Time", ""]
+
+        header_frame_stream = ctk.CTkFrame(self.scroll_all, fg_color=Colors.BG_MEDIUM, corner_radius=0)
+        header_frame_stream.grid(row=0, column=0, columnspan=16, sticky="ew", pady=(0, 2))
+
+        for i, h in enumerate(headers_stream):
+            label = ctk.CTkLabel(
+                header_frame_stream,
+                text=h,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=Colors.TEXT_SECONDARY,
+                width=50 if i >= 6 else 80
+            )
+            label.grid(row=0, column=i, padx=8, pady=10, sticky="w")
+
+    def _darken_color(self, hex_color: str) -> str:
+        """Darken a hex color by 20%"""
+        hex_color = hex_color.lstrip('#')
+        r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+        r, g, b = int(r * 0.8), int(g * 0.8), int(b * 0.8)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def toggle_view_mode(self, value: str):
+        """Switch between grouped and stream view"""
+        if value == "Grouped":
             self.scroll_all.grid_forget()
-            self.scroll_grouped.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+            self.scroll_grouped.grid(row=1, column=0, sticky="nsew")
         else:
             self.scroll_grouped.grid_forget()
-            self.scroll_all.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+            self.scroll_all.grid(row=1, column=0, sticky="nsew")
 
     def refresh_ports(self):
+        """Refresh available COM ports"""
         ports = [p.device for p in serial.tools.list_ports.comports()]
         if not ports:
-            ports = ["Brak"]
-            self.port_combo.set("Brak")
+            ports = ["No ports found"]
+            self.port_combo.set("No ports found")
         else:
             self.port_combo.set(ports[0])
         self.port_combo.configure(values=ports)
 
     def _update_tx_list(self):
+        """Update transmission function list"""
         items = []
         for cid, obj in self.function_labels.items():
             dev_name = obj.get("device", "Unknown")
             for data_pattern, func_name in obj.get("mappings", {}).items():
                 items.append(f"[{cid}] {func_name} ({dev_name})")
-        if not items: items = ["Brak zapisanych funkcji"]
+        if not items:
+            items = ["No functions saved"]
         items.sort()
         self.tx_combo.configure(values=items)
-        if items: self.tx_combo.set(items[0])
+        if items:
+            self.tx_combo.set(items[0])
 
-    # --- LOGIKA POŁĄCZENIA ---
     def toggle_connection(self):
+        """Toggle serial connection"""
         if not self.is_sniffing:
             selected_port = self.port_combo.get()
-            if selected_port == "Brak" or not selected_port:
-                messagebox.showerror("Błąd", "Nie wykryto portów COM!")
+            if selected_port == "No ports found" or not selected_port:
+                messagebox.showerror("Error", "No COM ports detected!")
                 return
+
             try:
                 self.ser = serial.Serial(selected_port, BAUD, timeout=0.1)
                 self.is_sniffing = True
                 self.is_paused = False
 
-                self.btn_connect.configure(text="ROZŁĄCZ", fg_color="#C0392B")
-                self.status_lbl.configure(text="STATUS: POŁĄCZONY", text_color="green")
+                # Initialize statistics
+                self.stats['start_time'] = datetime.now()
+                self.stats['last_update'] = datetime.now()
+                self.session_log.clear()
+
+                self.btn_connect.configure(text="DISCONNECT", fg_color=Colors.DANGER)
+                self.status_lbl.configure(text="● CONNECTED", text_color=Colors.SUCCESS)
                 self.port_combo.configure(state="disabled")
                 self.btn_refresh.configure(state="disabled")
-                self.btn_pause.configure(state="normal", text="PAUZA (ZAMROŹ)", fg_color="#E67E22")
+                self.btn_pause.configure(state="normal")
 
                 threading.Thread(target=self._serial_listener, daemon=True).start()
             except Exception as e:
-                messagebox.showerror("Błąd", str(e))
+                messagebox.showerror("Connection Error", f"Failed to connect:\n{str(e)}")
         else:
             self._disconnect_cleanup()
 
     def toggle_pause(self):
+        """Toggle pause state"""
         self.is_paused = not self.is_paused
         if self.is_paused:
-            self.btn_pause.configure(text="WZNÓW PODGLĄD", fg_color="#27AE60")
-            self.status_lbl.configure(text="STATUS: ZAMROŻONY", text_color="orange")
+            self.btn_pause.configure(text="▶ RESUME", fg_color=Colors.SUCCESS)
+            self.status_lbl.configure(text="● PAUSED", text_color=Colors.WARNING)
         else:
-            self.btn_pause.configure(text="PAUZA (ZAMROŹ)", fg_color="#E67E22")
-            self.status_lbl.configure(text="STATUS: POŁĄCZONY", text_color="green")
+            self.btn_pause.configure(text="⏸ PAUSE", fg_color=Colors.WARNING)
+            self.status_lbl.configure(text="● CONNECTED", text_color=Colors.SUCCESS)
 
     def _disconnect_cleanup(self):
+        """Clean up connection"""
         self.is_sniffing = False
         self.is_sending_active = False
         self.is_paused = False
+
         if self.ser:
             try:
                 self.ser.close()
             except:
                 pass
             self.ser = None
-        self.after(0, lambda: self.btn_connect.configure(text="POŁĄCZ", fg_color="green"))
-        self.after(0, lambda: self.status_lbl.configure(text="STATUS: ZATRZYMANO", text_color="orange"))
+
+        self.after(0, lambda: self.btn_connect.configure(text="CONNECT", fg_color=Colors.SUCCESS))
+        self.after(0, lambda: self.status_lbl.configure(text="● DISCONNECTED", text_color=Colors.TEXT_MUTED))
         self.after(0, lambda: self.port_combo.configure(state="normal"))
         self.after(0, lambda: self.btn_refresh.configure(state="normal"))
-        self.after(0, lambda: self.btn_send.configure(text="WYŚLIJ ROZKAZ", fg_color="#D35400"))
-        self.after(0, lambda: self.btn_pause.configure(state="disabled", text="PAUZA (ZAMROŹ)", fg_color="#E67E22"))
+        self.after(0, lambda: self.btn_send.configure(text="SEND COMMAND", fg_color=Colors.SECONDARY))
+        self.after(0, lambda: self.btn_pause.configure(state="disabled"))
 
     def _serial_listener(self):
+        """Serial port listener thread"""
+        print("Serial listener started")
         while self.is_sniffing:
             try:
                 if self.ser and self.ser.is_open:
@@ -228,41 +1262,466 @@ class ModernCANApp(ctk.CTk):
                         try:
                             line = self.ser.readline().decode('utf-8', errors='ignore').strip()
                             if line.startswith("FRAME:"):
-                                p = line.replace("FRAME:", "").split("|")
-                                if len(p) >= 5:
-                                    if not self.is_paused:
-                                        self.after(0, self.update_monitor, p[0], p[1], p[2], p[3], p[4].split(" "))
-                        except Exception:
-                            pass
+                                parts = line.replace("FRAME:", "").split("|")
+                                if len(parts) >= 5:
+                                    frame_data = {
+                                        'id': parts[0].upper(),
+                                        'rtr': parts[1],
+                                        'ide': parts[2],
+                                        'dlc': parts[3],
+                                        'data': parts[4].split(" "),
+                                        'timestamp': datetime.now()
+                                    }
+                                    self.can_queue.put(frame_data)
+                        except Exception as e:
+                            print(f"Parse error: {e}")
                     else:
                         time.sleep(0.005)
                 else:
                     break
-            except Exception:
+            except Exception as e:
+                print(f"Serial error: {e}")
                 self.is_sniffing = False
                 self.after(0, self._disconnect_cleanup)
                 break
+        print("Serial listener stopped")
 
-    # --- LOGIKA NADAWANIA (TX) ---
+    def _process_queue(self):
+        """Process CAN frames from queue"""
+        processed = 0
+        try:
+            while processed < 50:
+                frame = self.can_queue.get_nowait()
+
+                # Update statistics
+                self.stats['total_frames'] += 1
+                frame_id = frame['id']
+                if frame_id not in self.stats['frames_per_id']:
+                    self.stats['frames_per_id'][frame_id] = 0
+                self.stats['frames_per_id'][frame_id] += 1
+
+                # Add to session log
+                self.session_log.append({
+                    'timestamp': frame['timestamp'].strftime("%H:%M:%S.%f")[:-3],
+                    'id': frame_id,
+                    'rtr': frame['rtr'],
+                    'ide': frame['ide'],
+                    'dlc': frame['dlc'],
+                    'data': " ".join(frame['data'])
+                })
+
+                # Update monitor if not paused
+                if not self.is_paused:
+                    self.update_monitor(
+                        frame['id'],
+                        frame['rtr'],
+                        frame['ide'],
+                        frame['dlc'],
+                        frame['data']
+                    )
+
+                processed += 1
+        except queue.Empty:
+            pass
+
+        self.after(10, self._process_queue)
+
+    def _update_stats_display(self):
+        """Update statistics display"""
+        if self.is_sniffing and self.stats['start_time']:
+            elapsed = (datetime.now() - self.stats['start_time']).total_seconds()
+            fps = self.stats['total_frames'] / elapsed if elapsed > 0 else 0
+            self.stats_lbl.configure(text=f"{self.stats['total_frames']} frames | {fps:.1f} fps")
+
+        self.after(1000, self._update_stats_display)
+
+    def update_monitor(self, can_id: str, rtr: str, ide: str, dlc: str, bytes_list: List[str]):
+        """Update monitor display with validation"""
+        try:
+            # Validate DLC
+            dlc_int = int(dlc)
+            if not (0 <= dlc_int <= 8):
+                return
+
+            # Ensure 8 bytes (pad with 00)
+            bytes_list = list(bytes_list)
+            while len(bytes_list) < 8:
+                bytes_list.append("00")
+            bytes_list = bytes_list[:8]
+
+            # Validate hex format
+            for b in bytes_list:
+                int(b, 16)
+        except ValueError:
+            return
+
+        # Apply basic ID filter
+        filter_text = self.filter_entry.get().upper()
+        if filter_text and filter_text not in can_id.upper():
+            return
+
+        # Apply advanced filters
+        if hasattr(self, 'filter_settings'):
+            filters = self.filter_settings
+
+            # DLC range filter
+            if not (filters['min_dlc'] <= dlc_int <= filters['max_dlc']):
+                return
+
+            # Whitelist filter
+            if filters['id_whitelist'] and can_id.upper() not in filters['id_whitelist']:
+                return
+
+            # Blacklist filter
+            if can_id.upper() in filters['id_blacklist']:
+                return
+
+            # Hide all-zero data
+            if filters['hide_zero_data'] and all(b == "00" for b in bytes_list):
+                return
+
+            # Hide periodic (if message exists and hasn't changed)
+            if filters['hide_periodic'] and can_id in self.can_rows:
+                if self.can_rows[can_id]['last_data'] == bytes_list:
+                    return
+
+            # Show only changed (only show if message changed in last 2 seconds)
+            if filters['show_only_changed'] and can_id in self.can_rows:
+                if not hasattr(self.can_rows[can_id], 'last_change_time'):
+                    return
+                if (datetime.now() - self.can_rows[can_id].get('last_change_time', datetime.now())).total_seconds() > 2:
+                    return
+
+        data_str = " ".join(bytes_list)
+        current_mode = self.view_mode.get()
+
+        dev_name = self.id_labels.get(can_id, "Unknown")
+        mapping = self.function_labels.get(can_id, {})
+        det_func = mapping.get("mappings", {}).get(data_str, "---")
+
+        if current_mode == "Stream":
+            self._update_stream_view(can_id, rtr, ide, dlc, bytes_list, dev_name, det_func)
+        else:
+            self._update_grouped_view(can_id, rtr, ide, dlc, bytes_list, dev_name, det_func, data_str)
+
+    def _update_stream_view(self, can_id, rtr, ide, dlc, bytes_list, dev_name, det_func):
+        """Update stream view"""
+        if self.sort_newest_first:
+            # Insert at top, shift everything down
+            if len(self.all_msgs_widgets) >= MAX_ALL_ROWS:
+                # Remove last (oldest)
+                oldest = self.all_msgs_widgets.pop()
+                for w in oldest:
+                    try:
+                        w.destroy()
+                    except:
+                        pass
+
+            # Shift all rows down
+            for row_widgets in self.all_msgs_widgets:
+                for widget in row_widgets:
+                    try:
+                        current_row = widget.grid_info()['row']
+                        widget.grid(row=current_row + 1)
+                    except:
+                        pass
+
+            row = 1  # New message at top
+            self.row_counter_all += 1
+        else:
+            # Default: add at bottom
+            if len(self.all_msgs_widgets) >= MAX_ALL_ROWS:
+                oldest = self.all_msgs_widgets.pop(0)
+                for w in oldest:
+                    try:
+                        w.destroy()
+                    except:
+                        pass
+
+            row = self.row_counter_all
+            self.row_counter_all += 1
+
+        bg = Colors.BG_MEDIUM if row % 2 == 0 else Colors.BG_DARK
+
+        widgets = []
+
+        def add_lbl(txt, col, color=Colors.TEXT_PRIMARY, width=50):
+            l = ctk.CTkLabel(
+                self.scroll_all,
+                text=txt,
+                fg_color=bg,
+                text_color=color,
+                width=width,
+                anchor="w",
+                font=ctk.CTkFont(size=11)
+            )
+            l.grid(row=row, column=col, padx=4, pady=1, sticky="ew")
+            widgets.append(l)
+
+        add_lbl(can_id, 0, Colors.PRIMARY, 80)
+        add_lbl(dev_name, 1, Colors.SUCCESS if dev_name != "Unknown" else Colors.TEXT_MUTED, 120)
+        add_lbl(det_func, 2, Colors.WARNING if det_func != "---" else Colors.TEXT_MUTED, 150)
+        add_lbl(rtr, 3, Colors.TEXT_SECONDARY, 40)
+        add_lbl(ide, 4, Colors.TEXT_SECONDARY, 40)
+        add_lbl(dlc, 5, Colors.TEXT_SECONDARY, 40)
+
+        for j in range(8):
+            val = bytes_list[j]
+            color = Colors.DANGER if val != "00" else Colors.TEXT_MUTED
+            add_lbl(val, 6 + j, color, 40)
+
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        add_lbl(timestamp, 14, Colors.TEXT_MUTED, 80)
+
+        # ADD SAVE BUTTON
+        data_str = " ".join(bytes_list)
+        btn = ctk.CTkButton(
+            self.scroll_all,
+            text="+",
+            width=30,
+            height=24,
+            command=lambda: self._save_function_stream(can_id, data_str),
+            fg_color=Colors.SUCCESS,
+            hover_color="#059669",
+            corner_radius=6,
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        btn.grid(row=row, column=15, padx=4, pady=1)
+        widgets.append(btn)
+
+        if self.sort_newest_first:
+            # Insert at beginning for newest first
+            self.all_msgs_widgets.insert(0, widgets)
+        else:
+            # Append at end for oldest first
+            self.all_msgs_widgets.append(widgets)
+
+    def _save_function_stream(self, can_id: str, data_str: str):
+        """Save function for CAN ID from stream view"""
+        dev_label = self.id_labels.get(can_id, "Unknown")
+
+        dialog = ctk.CTkInputDialog(
+            text=f"ID: {can_id}\nLabel: {dev_label}\nFunction for: {data_str}",
+            title="Function Database"
+        )
+        val = dialog.get_input()
+
+        if val:
+            if can_id not in self.function_labels:
+                self.function_labels[can_id] = {"device": dev_label, "mappings": {}}
+            self.function_labels[can_id]["device"] = dev_label
+            self.function_labels[can_id]["mappings"][data_str] = val
+            self._save_db(DB_FUNCTIONS, self.function_labels)
+            self._update_tx_list()
+            self._show_status(f"✓ Function saved for ID {can_id}", 3000, Colors.SUCCESS)
+
+    def _update_grouped_view(self, can_id, rtr, ide, dlc, bytes_list, dev_name, det_func, data_str):
+        """Update grouped view"""
+        if can_id not in self.can_rows:
+            # NEW ROW - insert at correct position based on sort order
+            if self.sort_newest_first:
+                # Insert at top (row 1)
+                row = 1
+                # Shift all existing rows down
+                for existing_id, existing_row in self.can_rows.items():
+                    for widget in existing_row['widgets']:
+                        try:
+                            current_row = widget.grid_info()['row']
+                            widget.grid(row=current_row + 1)
+                        except:
+                            pass
+                self.row_counter_grouped += 1
+            else:
+                # Insert at bottom (default)
+                row = self.row_counter_grouped
+                self.row_counter_grouped += 1
+
+            # Alternating background color - ALWAYS use BG_MEDIUM for highlight
+            bg = Colors.BG_MEDIUM
+
+            # Create labels directly in grid (no container frame)
+            id_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=can_id,
+                text_color=Colors.PRIMARY,
+                cursor="hand2",
+                width=80,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11, weight="bold")
+            )
+            id_l.grid(row=row, column=0, padx=8, pady=4, sticky="ew")
+            id_l.bind("<Button-1>", lambda e, cid=can_id: self._open_id_edit(cid))
+
+            dev_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=dev_name,
+                text_color=Colors.SUCCESS if dev_name != "Unknown" else Colors.TEXT_MUTED,
+                width=120,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11)
+            )
+            dev_l.grid(row=row, column=1, padx=8, pady=4, sticky="ew")
+
+            func_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=det_func,
+                text_color=Colors.WARNING if det_func != "---" else Colors.TEXT_MUTED,
+                width=150,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11)
+            )
+            func_l.grid(row=row, column=2, padx=8, pady=4, sticky="ew")
+
+            rtr_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=rtr,
+                text_color=Colors.TEXT_SECONDARY,
+                width=40,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11)
+            )
+            rtr_l.grid(row=row, column=3, padx=8, pady=4, sticky="ew")
+
+            ide_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=ide,
+                text_color=Colors.TEXT_SECONDARY,
+                width=40,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11)
+            )
+            ide_l.grid(row=row, column=4, padx=8, pady=4, sticky="ew")
+
+            dlc_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=dlc,
+                text_color=Colors.TEXT_SECONDARY,
+                width=40,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11)
+            )
+            dlc_l.grid(row=row, column=5, padx=8, pady=4, sticky="ew")
+
+            b_labels = []
+            for j in range(8):
+                val = bytes_list[j]
+                color = Colors.DANGER if val != "00" else Colors.TEXT_MUTED
+                l = ctk.CTkLabel(
+                    self.scroll_grouped,
+                    text=val,
+                    text_color=color,
+                    width=50,
+                    fg_color=bg,
+                    font=ctk.CTkFont(size=11)
+                )
+                l.grid(row=row, column=6 + j, padx=4, pady=4, sticky="ew")
+                b_labels.append(l)
+
+            btn = ctk.CTkButton(
+                self.scroll_grouped,
+                text="+",
+                width=35,
+                height=28,
+                command=lambda cid=can_id: self._save_function(cid),
+                fg_color=Colors.SUCCESS,
+                hover_color="#059669",
+                corner_radius=6,
+                font=ctk.CTkFont(size=14, weight="bold")
+            )
+            btn.grid(row=row, column=14, padx=8, pady=4)
+
+            widgets = [id_l, dev_l, func_l, rtr_l, ide_l, dlc_l] + b_labels  # Don't include button in fade list
+            self.can_rows[can_id] = {
+                'dev_lbl': dev_l,
+                'func_lbl': func_l,
+                'bytes': b_labels,
+                'last_data': bytes_list.copy(),
+                'widgets': widgets + [btn],  # Include button for cleanup
+                'bg': bg
+            }
+
+            # Highlight animation - fade background to transparent (dark)
+            def fade():
+                try:
+                    for w in widgets:  # Only fade labels, not button
+                        if w.winfo_exists():
+                            w.configure(fg_color=Colors.BG_DARK)
+                except:
+                    pass
+
+            self.after(2000, fade)
+
+        else:
+            # Update existing row
+            r = self.can_rows[can_id]
+            r['func_lbl'].configure(
+                text=det_func,
+                text_color=Colors.WARNING if det_func != "---" else Colors.TEXT_MUTED
+            )
+
+            # Update bytes with MORE VISIBLE change animation
+            for i in range(8):
+                if i < len(bytes_list):
+                    current_val = bytes_list[i]
+
+                    if i < len(r['last_data']) and current_val != r['last_data'][i]:
+                        lbl = r['bytes'][i]
+
+                        # BRIGHT highlight with red background
+                        lbl.configure(
+                            text=current_val,
+                            text_color="#FFFFFF",
+                            font=ctk.CTkFont(weight="bold", size=12),
+                            fg_color="#DC2626"
+                        )
+
+                        # Create closure with current values
+                        def make_reset(label, value):
+                            def reset():
+                                try:
+                                    if label.winfo_exists():
+                                        byte_color = Colors.DANGER if value != "00" else Colors.TEXT_MUTED
+                                        label.configure(
+                                            text=value,
+                                            text_color=byte_color,
+                                            font=ctk.CTkFont(weight="normal", size=11),
+                                            fg_color="transparent"
+                                        )
+                                except:
+                                    pass
+
+                            return reset
+
+                        self.after(350, make_reset(lbl, current_val))
+
+            # Update last_data after all changes
+            r['last_data'] = bytes_list[:]
+
     def handle_send_click(self):
+        """Handle send button click"""
         if self.is_sending_active:
             self.is_sending_active = False
-            self.btn_send.configure(text="WYŚLIJ ROZKAZ", fg_color="#D35400")
+            self.btn_send.configure(text="SEND COMMAND", fg_color=Colors.SECONDARY)
             return
+
         if not self.ser or not self.ser.is_open:
-            messagebox.showwarning("Błąd", "Brak połączenia!")
+            messagebox.showwarning("Error", "No connection!")
             return
+
         selection = self.tx_combo.get()
-        if not selection or selection == "Brak zapisanych funkcji": return
+        if not selection or selection == "No functions saved":
+            return
 
         try:
             count = int(self.entry_repeat.get())
             interval_ms = int(self.entry_interval.get())
         except:
+            messagebox.showerror("Error", "Invalid count or interval!")
             return
 
         target_id = selection.split("]")[0].replace("[", "")
         data_to_send = None
+
         if target_id in self.function_labels:
             mappings = self.function_labels[target_id].get("mappings", {})
             for d_str, f_name in mappings.items():
@@ -272,48 +1731,74 @@ class ModernCANApp(ctk.CTk):
 
         if data_to_send:
             self.is_sending_active = True
-            self.btn_send.configure(text="ZATRZYMAJ", fg_color="#C0392B")
-            threading.Thread(target=self._sending_loop, args=(target_id, data_to_send, count, interval_ms),
-                             daemon=True).start()
+            self.btn_send.configure(text="⏹ STOP", fg_color=Colors.DANGER)
+            threading.Thread(
+                target=self._sending_loop,
+                args=(target_id, data_to_send, count, interval_ms),
+                daemon=True
+            ).start()
 
-    def _sending_loop(self, target_id, data_str, count, interval_ms):
+    def _sending_loop(self, target_id: str, data_str: str, count: int, interval_ms: int):
+        """Transmission loop"""
         command = f"SEND:{target_id}|{data_str}\n"
         encoded = command.encode('utf-8')
+
         for i in range(count):
-            if not self.is_sending_active or not self.is_sniffing: break
+            if not self.is_sending_active or not self.is_sniffing:
+                break
             try:
                 self.ser.write(encoded)
             except:
                 self.is_sending_active = False
                 break
             time.sleep(interval_ms / 1000.0)
-        self.is_sending_active = False
-        self.after(0, lambda: self.btn_send.configure(text="WYŚLIJ ROZKAZ", fg_color="#D35400"))
 
-    # --- ZARZĄDZANIE BAZAMI DANYCH (Przywrócone z Twojego kodu) ---
+        self.is_sending_active = False
+        self.after(0, lambda: self.btn_send.configure(text="SEND COMMAND", fg_color=Colors.SECONDARY))
+
     def win_manage_ids(self):
+        """ID management window"""
         win = ctk.CTkToplevel(self)
-        win.title("Zarządzanie ID")
-        win.geometry("500x500")
+        win.title("Manage IDs")
+        win.geometry("600x500")
         win.attributes("-topmost", True)
+        win.configure(fg_color=Colors.BG_DARK)  # Dark background
+
+        # Style for treeview
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview",
+                        background=Colors.BG_MEDIUM,
+                        foreground=Colors.TEXT_PRIMARY,
+                        fieldbackground=Colors.BG_MEDIUM,
+                        borderwidth=0)
+        style.configure("Treeview.Heading",
+                        background=Colors.BG_LIGHT,
+                        foreground=Colors.TEXT_PRIMARY,
+                        borderwidth=0)
+        style.map('Treeview', background=[('selected', Colors.PRIMARY)])
+
         tree = ttk.Treeview(win, columns=("id", "name"), show='headings')
-        tree.heading("id", text="ID (Hex)");
-        tree.heading("name", text="Nazwa Urządzenia")
+        tree.heading("id", text="ID (Hex)")
+        tree.heading("name", text="Device Name")
         tree.pack(fill="both", expand=True, padx=10, pady=10)
 
         def reload():
-            for i in tree.get_children(): tree.delete(i)
-            for k in sorted(self.id_labels.keys()): tree.insert('', tk.END, values=(k, self.id_labels[k]))
+            for i in tree.get_children():
+                tree.delete(i)
+            for k in sorted(self.id_labels.keys()):
+                tree.insert('', tk.END, values=(k, self.id_labels[k]))
 
         def delete():
             sel = tree.selection()
             if sel:
                 cid = str(tree.item(sel[0])['values'][0])
-                if messagebox.askyesno("Usuń", f"Czy na pewno usunąć opis dla ID {cid}?"):
+                if messagebox.askyesno("Delete", f"Delete description for ID {cid}?"):
                     del self.id_labels[cid]
                     self._save_db(DB_IDS, self.id_labels)
-                    if cid in self.can_rows: self.can_rows[cid]['dev_lbl'].configure(text="---", text_color="gray")
-                    reload();
+                    if cid in self.can_rows:
+                        self.can_rows[cid]['dev_lbl'].configure(text="Unknown", text_color=Colors.TEXT_MUTED)
+                    reload()
                     self._update_tx_list()
 
         def edit():
@@ -321,235 +1806,373 @@ class ModernCANApp(ctk.CTk):
             if sel:
                 cid = str(tree.item(sel[0])['values'][0])
                 old_name = self.id_labels.get(cid, "")
-                dialog = ctk.CTkInputDialog(text=f"Edytuj nazwę dla ID {cid}:\n(Aktualnie: {old_name})",
-                                            title="Edycja ID")
+                dialog = ctk.CTkInputDialog(
+                    text=f"Edit name for ID {cid}:\n(Current: {old_name})",
+                    title="Edit ID"
+                )
                 new_name = dialog.get_input()
                 if new_name:
                     self.id_labels[cid] = new_name
                     self._save_db(DB_IDS, self.id_labels)
-                    if cid in self.can_rows: self.can_rows[cid]['dev_lbl'].configure(text=new_name,
-                                                                                     text_color="#2ECC71")
-                    reload();
+                    if cid in self.can_rows:
+                        self.can_rows[cid]['dev_lbl'].configure(text=new_name, text_color=Colors.SUCCESS)
+                    reload()
                     self._update_tx_list()
             else:
-                messagebox.showinfo("Info", "Zaznacz wiersz do edycji.")
+                messagebox.showinfo("Info", "Select a row to edit.")
 
-        f = ctk.CTkFrame(win);
-        f.pack(fill="x", padx=10, pady=5)
-        ctk.CTkButton(f, text="Usuń", fg_color="#C0392B", width=100, command=delete).pack(side="left", padx=5)
-        ctk.CTkButton(f, text="Edytuj", fg_color="#F39C12", width=100, command=edit).pack(side="left", padx=5)
+        btn_frame = ctk.CTkFrame(win, fg_color=Colors.BG_DARK)
+        btn_frame.pack(fill="x", padx=10, pady=10)
+
+        ctk.CTkButton(btn_frame, text="Delete", fg_color=Colors.DANGER, width=100, command=delete).pack(side="left",
+                                                                                                        padx=5)
+        ctk.CTkButton(btn_frame, text="Edit", fg_color=Colors.WARNING, width=100, command=edit).pack(side="left",
+                                                                                                     padx=5)
+
         reload()
 
     def win_manage_funcs(self):
+        """Function management window"""
         win = ctk.CTkToplevel(self)
-        win.title("Zarządzanie Funkcjami")
+        win.title("Manage Functions")
         win.geometry("900x500")
         win.attributes("-topmost", True)
+        win.configure(fg_color=Colors.BG_DARK)  # Dark background
+
+        # Style for treeview
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview",
+                        background=Colors.BG_MEDIUM,
+                        foreground=Colors.TEXT_PRIMARY,
+                        fieldbackground=Colors.BG_MEDIUM,
+                        borderwidth=0)
+        style.configure("Treeview.Heading",
+                        background=Colors.BG_LIGHT,
+                        foreground=Colors.TEXT_PRIMARY,
+                        borderwidth=0)
+        style.map('Treeview', background=[('selected', Colors.PRIMARY)])
+
         tree = ttk.Treeview(win, columns=("id", "dev", "data", "func"), show='headings')
-        tree.heading("id", text="ID");
-        tree.heading("dev", text="Urządzenie");
-        tree.heading("data", text="Wzorzec Danych");
-        tree.heading("func", text="Opis Funkcji")
-        tree.column("id", width=60, anchor="center");
-        tree.column("dev", width=150, anchor="w");
-        tree.column("data", width=250, anchor="center");
+        tree.heading("id", text="ID")
+        tree.heading("dev", text="Device")
+        tree.heading("data", text="Data Pattern")
+        tree.heading("func", text="Function Description")
+        tree.column("id", width=60, anchor="center")
+        tree.column("dev", width=150, anchor="w")
+        tree.column("data", width=250, anchor="center")
         tree.column("func", width=300, anchor="w")
         tree.pack(fill="both", expand=True, padx=10, pady=10)
 
         def reload():
-            for i in tree.get_children(): tree.delete(i)
+            for i in tree.get_children():
+                tree.delete(i)
             for cid in sorted(self.function_labels.keys()):
                 obj = self.function_labels[cid]
-                for d, f in obj.get("mappings", {}).items(): tree.insert('', tk.END,
-                                                                         values=(cid, obj.get("device", "---"), d, f))
+                for d, f in obj.get("mappings", {}).items():
+                    tree.insert('', tk.END, values=(cid, obj.get("device", "---"), d, f))
 
         def delete():
             sel = tree.selection()
             if sel:
                 v = tree.item(sel[0])['values']
                 cid, d_str = str(v[0]), str(v[2])
-                if messagebox.askyesno("Usuń", "Usunąć tę funkcję?"):
+                if messagebox.askyesno("Delete", "Delete this function?"):
                     del self.function_labels[cid]["mappings"][d_str]
-                    if not self.function_labels[cid]["mappings"]: del self.function_labels[cid]
+                    if not self.function_labels[cid]["mappings"]:
+                        del self.function_labels[cid]
                     self._save_db(DB_FUNCTIONS, self.function_labels)
-                    reload();
+                    reload()
                     self._update_tx_list()
 
         def edit():
             sel = tree.selection()
             if sel:
                 v = tree.item(sel[0])['values']
-                cid = str(v[0]);
-                d_str = str(v[2]);
+                cid = str(v[0])
+                d_str = str(v[2])
                 old_func = str(v[3])
-                dialog = ctk.CTkInputDialog(text=f"Edytuj opis funkcji dla ID {cid}:\n[{d_str}]",
-                                            title="Edycja Funkcji")
+                dialog = ctk.CTkInputDialog(
+                    text=f"Edit function description for ID {cid}:\n[{d_str}]",
+                    title="Edit Function"
+                )
                 new_func = dialog.get_input()
                 if new_func:
                     self.function_labels[cid]["mappings"][d_str] = new_func
                     self._save_db(DB_FUNCTIONS, self.function_labels)
                     if cid in self.can_rows:
                         current_data = " ".join(self.can_rows[cid]['last_data'])
-                        if current_data == d_str: self.can_rows[cid]['func_lbl'].configure(text=new_func,
-                                                                                           text_color="#F1C40F")
-                    reload();
+                        if current_data == d_str:
+                            self.can_rows[cid]['func_lbl'].configure(text=new_func, text_color=Colors.WARNING)
+                    reload()
                     self._update_tx_list()
             else:
-                messagebox.showinfo("Info", "Zaznacz wiersz do edycji.")
+                messagebox.showinfo("Info", "Select a row to edit.")
 
-        f = ctk.CTkFrame(win);
-        f.pack(fill="x", padx=10, pady=5)
-        ctk.CTkButton(f, text="Usuń", fg_color="#C0392B", width=100, command=delete).pack(side="left", padx=5)
-        ctk.CTkButton(f, text="Edytuj", fg_color="#F39C12", width=100, command=edit).pack(side="left", padx=5)
+        btn_frame = ctk.CTkFrame(win, fg_color=Colors.BG_DARK)
+        btn_frame.pack(fill="x", padx=10, pady=10)
+
+        ctk.CTkButton(btn_frame, text="Delete", fg_color=Colors.DANGER, width=100, command=delete).pack(side="left",
+                                                                                                        padx=5)
+        ctk.CTkButton(btn_frame, text="Edit", fg_color=Colors.WARNING, width=100, command=edit).pack(side="left",
+                                                                                                     padx=5)
+
         reload()
 
-    def _open_id_edit(self, can_id):
-        d = ctk.CTkInputDialog(text=f"Etykieta dla {can_id}:", title="Baza ID")
-        v = d.get_input()
-        if v:
-            self.id_labels[can_id] = v
+    def _open_id_edit(self, can_id: str):
+        """Open ID edit dialog"""
+        dialog = ctk.CTkInputDialog(text=f"Label for {can_id}:", title="ID Database")
+        value = dialog.get_input()
+        if value:
+            self.id_labels[can_id] = value
             self._save_db(DB_IDS, self.id_labels)
-            if can_id in self.can_rows: self.can_rows[can_id]['dev_lbl'].configure(text=v, text_color="#2ECC71")
+            if can_id in self.can_rows:
+                self.can_rows[can_id]['dev_lbl'].configure(text=value, text_color=Colors.SUCCESS)
             self._update_tx_list()
 
-    def _save_function(self, can_id):
+    def _save_function(self, can_id: str):
+        """Save function for CAN ID"""
         if can_id in self.can_rows:
             data_str = " ".join(self.can_rows[can_id]['last_data'])
         else:
             return
-        dev_label = self.id_labels.get(can_id, "Nieznane")
-        d = ctk.CTkInputDialog(text=f"ID: {can_id}\nEtykieta: {dev_label}\nFunkcja dla: {data_str}",
-                               title="Baza Funkcji")
-        val = d.get_input()
+
+        dev_label = self.id_labels.get(can_id, "Unknown")
+        dialog = ctk.CTkInputDialog(
+            text=f"ID: {can_id}\nLabel: {dev_label}\nFunction for: {data_str}",
+            title="Function Database"
+        )
+        val = dialog.get_input()
+
         if val:
-            if can_id not in self.function_labels: self.function_labels[can_id] = {"device": dev_label, "mappings": {}}
+            if can_id not in self.function_labels:
+                self.function_labels[can_id] = {"device": dev_label, "mappings": {}}
             self.function_labels[can_id]["device"] = dev_label
             self.function_labels[can_id]["mappings"][data_str] = val
             self._save_db(DB_FUNCTIONS, self.function_labels)
             if can_id in self.can_rows:
-                self.can_rows[can_id]['func_lbl'].configure(text=val, text_color="#F1C40F")
+                self.can_rows[can_id]['func_lbl'].configure(text=val, text_color=Colors.WARNING)
             self._update_tx_list()
 
     def _clear_monitor(self):
+        """Clear monitor display with modern dialog"""
+        # Create custom dialog
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Clear Monitor")
+        dialog.geometry("450x250")
+        dialog.resizable(False, False)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+
+        # Center the dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (225)
+        y = (dialog.winfo_screenheight() // 2) - (125)
+        dialog.geometry(f"450x250+{x}+{y}")
+
+        dialog.configure(fg_color=Colors.BG_DARK)
+
+        response = {"value": None}
+
+        main_frame = ctk.CTkFrame(dialog, fg_color=Colors.BG_DARK)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(
+            main_frame,
+            text="Clear display and reset statistics?",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=Colors.TEXT_PRIMARY
+        ).pack(pady=(10, 20))
+
+        ctk.CTkLabel(
+            main_frame,
+            text="• Yes = Clear display + reset stats\n• No = Clear display only\n• Cancel = Do nothing",
+            font=ctk.CTkFont(size=12),
+            text_color=Colors.TEXT_SECONDARY,
+            justify="left"
+        ).pack(pady=10)
+
+        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        btn_frame.pack(side="bottom", pady=(20, 10))
+
+        def on_yes():
+            response["value"] = True
+            dialog.destroy()
+
+        def on_no():
+            response["value"] = False
+            dialog.destroy()
+
+        def on_cancel():
+            response["value"] = None
+            dialog.destroy()
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Yes",
+            command=on_yes,
+            fg_color=Colors.SUCCESS,
+            hover_color="#059669",
+            width=120,
+            height=36
+        ).pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="No",
+            command=on_no,
+            fg_color=Colors.WARNING,
+            hover_color="#D97706",
+            width=120,
+            height=36
+        ).pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Cancel",
+            command=on_cancel,
+            fg_color=Colors.BG_LIGHT,
+            hover_color=Colors.BG_MEDIUM,
+            width=120,
+            height=36
+        ).pack(side="left", padx=5)
+
+        self.wait_window(dialog)
+
+        if response["value"] is None:
+            return
+
+        # Clear grouped view
         for r in self.can_rows.values():
-            for w in r['widgets']: w.destroy()
+            for w in r['widgets']:
+                try:
+                    w.destroy()
+                except:
+                    pass
         self.can_rows.clear()
         self.row_counter_grouped = 1
 
+        # Clear stream view
         for row_widgets in self.all_msgs_widgets:
-            for w in row_widgets: w.destroy()
+            for w in row_widgets:
+                try:
+                    w.destroy()
+                except:
+                    pass
         self.all_msgs_widgets.clear()
         self.row_counter_all = 1
 
-    # --- GLÓWNA LOGIKA AKTUALIZACJI ---
-    def update_monitor(self, can_id, rtr, ide, dlc, bytes_list):
-        data_str = " ".join(bytes_list)
-        current_mode = self.view_mode.get()
-
-        dev_name = self.id_labels.get(can_id, "---")
-        mapping = self.function_labels.get(can_id, {})
-        det_func = mapping.get("mappings", {}).get(data_str, "---")
-
-        if current_mode == "All Messages":
-            if len(self.all_msgs_widgets) >= MAX_ALL_ROWS:
-                oldest_row_widgets = self.all_msgs_widgets.pop(0)
-                for w in oldest_row_widgets: w.destroy()
-
-            row = self.row_counter_all
-            self.row_counter_all += 1
-            bg_color = "#2C3E50" if row % 2 == 0 else "#212F3D"
-
-            widgets_in_this_row = []
-
-            def add_lbl(txt, col, color="white"):
-                l = ctk.CTkLabel(self.scroll_all, text=txt, fg_color=bg_color, text_color=color)
-                l.grid(row=row, column=col, padx=2, pady=1, sticky="nsew")
-                widgets_in_this_row.append(l)
-
-            add_lbl(can_id, 0, "#3498DB")
-            add_lbl(dev_name, 1, "gray" if dev_name == "---" else "#2ECC71")
-            add_lbl(det_func, 2, "#F1C40F" if det_func != "---" else "gray")
-            add_lbl(rtr, 3)
-            add_lbl(ide, 4)
-            add_lbl(dlc, 5)
-
-            for j in range(8):
-                val = bytes_list[j] if j < len(bytes_list) else "00"
-                byte_color = "white" if val == "00" else "#E74C3C"
-                add_lbl(val, 6 + j, byte_color)
-
-            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            add_lbl(timestamp, 14, "gray")
-            self.all_msgs_widgets.append(widgets_in_this_row)
-
+        # Reset stats if Yes - NO MORE MESSAGEBOX!
+        if response["value"]:
+            self.session_log.clear()
+            self.stats = {
+                'total_frames': 0,
+                'frames_per_id': {},
+                'start_time': datetime.now() if self.is_sniffing else None
+            }
+            self._show_status("✓ Display and statistics cleared!", 4000, Colors.SUCCESS)
         else:
-            if can_id not in self.can_rows:
-                row = self.row_counter_grouped
-                self.row_counter_grouped += 1
-                hi_bg = "#1B4F72"
+            self._show_status("✓ Display cleared (statistics preserved)", 4000, Colors.INFO)
 
-                id_l = ctk.CTkLabel(self.scroll_grouped, text=can_id, text_color="#3498DB", cursor="hand2",
-                                    fg_color=hi_bg)
-                id_l.grid(row=row, column=0, padx=2, pady=1)
-                id_l.bind("<Button-1>", lambda e, cid=can_id: self._open_id_edit(cid))
+    def _show_toast(self, message: str, color: str):
+        """Show a temporary toast notification"""
+        toast = ctk.CTkFrame(
+            self,
+            fg_color=color,
+            corner_radius=8
+        )
+        toast.place(relx=0.5, rely=0.95, anchor="center")
 
-                dev_l = ctk.CTkLabel(self.scroll_grouped, text=dev_name, fg_color=hi_bg,
-                                     text_color="gray" if dev_name == "---" else "#2ECC71")
-                dev_l.grid(row=row, column=1, padx=2, pady=1)
+        ctk.CTkLabel(
+            toast,
+            text=message,
+            font=ctk.CTkFont(size=12),
+            text_color="white"
+        ).pack(padx=20, pady=10)
 
-                func_l = ctk.CTkLabel(self.scroll_grouped, text=det_func, fg_color=hi_bg,
-                                      text_color="#F1C40F" if det_func != "---" else "gray")
-                func_l.grid(row=row, column=2, padx=2, pady=1)
+        def fade_out():
+            try:
+                toast.destroy()
+            except:
+                pass
 
-                rtr_l = ctk.CTkLabel(self.scroll_grouped, text=rtr, fg_color=hi_bg)
-                rtr_l.grid(row=row, column=3, padx=2, pady=1)
-                ide_l = ctk.CTkLabel(self.scroll_grouped, text=ide, fg_color=hi_bg)
-                ide_l.grid(row=row, column=4, padx=2, pady=1)
-                dlc_l = ctk.CTkLabel(self.scroll_grouped, text=dlc, fg_color=hi_bg)
-                dlc_l.grid(row=row, column=5, padx=2, pady=1)
+        self.after(2000, fade_out)
 
-                b_labels = []
-                for j in range(8):
-                    val = bytes_list[j] if j < len(bytes_list) else "00"
-                    l = ctk.CTkLabel(self.scroll_grouped, text=val, width=40, fg_color=hi_bg)
-                    l.grid(row=row, column=6 + j, padx=2, pady=1)
-                    b_labels.append(l)
+    def export_session_log(self):
+        """Export captured CAN traffic to CSV"""
+        if not self.session_log:
+            self._show_status("⚠ No data to export!", 3000, Colors.WARNING)
+            return
 
-                btn = ctk.CTkButton(self.scroll_grouped, text="+", width=40,
-                                    command=lambda cid=can_id: self._save_function(cid))
-                btn.grid(row=row, column=14, padx=5)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"can_log_{timestamp}.csv"
 
-                widgets = [id_l, dev_l, func_l, rtr_l, ide_l, dlc_l] + b_labels
-                self.can_rows[can_id] = {'dev_lbl': dev_l, 'func_lbl': func_l, 'bytes': b_labels,
-                                         'last_data': bytes_list, 'widgets': widgets + [btn]}
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['timestamp', 'id', 'rtr', 'ide', 'dlc', 'data'])
+                writer.writeheader()
+                writer.writerows(self.session_log)
 
-                def fade():
-                    try:
-                        for w in widgets:
-                            if w.winfo_exists(): w.configure(fg_color="transparent")
-                    except:
-                        pass
+            self._show_status(f"✓ Saved {len(self.session_log)} frames to {filename}", 5000, Colors.SUCCESS)
+        except Exception as e:
+            self._show_status(f"✗ Failed to save log: {str(e)}", 5000, Colors.DANGER)
 
-                self.after(2000, fade)
+    def show_statistics(self):
+        """Display session statistics"""
+        win = ctk.CTkToplevel(self)
+        win.title("Session Statistics")
+        win.geometry("600x500")
+        win.attributes("-topmost", True)
 
-            else:
-                r = self.can_rows[can_id]
-                r['func_lbl'].configure(text=det_func, text_color="#F1C40F" if det_func != "---" else "gray")
-                for i in range(len(bytes_list)):
-                    if i < len(r['last_data']) and bytes_list[i] != r['last_data'][i]:
-                        lbl = r['bytes'][i]
-                        lbl.configure(text=bytes_list[i], text_color="#FF5555", font=ctk.CTkFont(weight="bold"),
-                                      fg_color="#4A1515")
+        # Calculate stats
+        total = self.stats['total_frames']
+        unique_ids = len(self.stats['frames_per_id'])
 
-                        def reset(l=lbl):
-                            try:
-                                if l.winfo_exists(): l.configure(text_color="white", font=ctk.CTkFont(weight="normal"),
-                                                                 fg_color="transparent")
-                            except:
-                                pass
+        if self.stats['start_time']:
+            elapsed = (datetime.now() - self.stats['start_time']).total_seconds()
+            fps = total / elapsed if elapsed > 0 else 0
+        else:
+            elapsed = 0
+            fps = 0
 
-                        self.after(350, reset)
-                        r['last_data'][i] = bytes_list[i]
+        # Overall stats
+        info_frame = ctk.CTkFrame(win, fg_color=Colors.BG_MEDIUM)
+        info_frame.pack(fill="x", padx=15, pady=15)
+
+        ctk.CTkLabel(
+            info_frame,
+            text=f"Total Frames: {total}",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(pady=8)
+        ctk.CTkLabel(info_frame, text=f"Unique IDs: {unique_ids}").pack(pady=4)
+        ctk.CTkLabel(info_frame, text=f"Elapsed Time: {elapsed:.1f}s").pack(pady=4)
+        ctk.CTkLabel(info_frame, text=f"Average Rate: {fps:.1f} fps").pack(pady=4)
+
+        # Top IDs
+        ctk.CTkLabel(
+            win,
+            text="Top Active IDs:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(pady=(15, 5))
+
+        tree_frame = ctk.CTkFrame(win)
+        tree_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+        tree = ttk.Treeview(tree_frame, columns=("id", "count", "percent"), show='headings', height=15)
+        tree.heading("id", text="CAN ID")
+        tree.heading("count", text="Frame Count")
+        tree.heading("percent", text="Percentage")
+        tree.column("id", width=150, anchor="center")
+        tree.column("count", width=150, anchor="center")
+        tree.column("percent", width=150, anchor="center")
+        tree.pack(fill="both", expand=True)
+
+        sorted_ids = sorted(self.stats['frames_per_id'].items(), key=lambda x: x[1], reverse=True)
+
+        for can_id, count in sorted_ids[:20]:
+            percent = (count / total * 100) if total > 0 else 0
+            device = self.id_labels.get(can_id, "Unknown")
+            tree.insert('', tk.END, values=(f"{can_id} ({device})", count, f"{percent:.1f}%"))
 
 
 if __name__ == "__main__":
