@@ -3,7 +3,7 @@ import serial.tools.list_ports
 import threading
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import json
 import os
 import time
@@ -44,7 +44,7 @@ class ModernCANApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("CAN Sniffer")
-        self.geometry("1800x900")
+        self.geometry("1920x1080")
         self.minsize(1400, 700)
 
         # Data structures
@@ -83,12 +83,32 @@ class ModernCANApp(ctk.CTk):
 
         # ADD THIS:
         self.sort_newest_first = False  # False = oldest first (default), True = newest first
+        # Playback state (NEW)
+        self.is_playing_back = False
+        self.playback_thread = None
+        self.loaded_session = []
 
+        # Session start timestamp for relative time (NEW)
+        self.session_start_time: Optional[datetime] = None
+
+        # Window close handler
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
         self._build_modern_ui()
         self._update_tx_list()
         self.after(10, self._process_queue)
         self.after(1000, self._update_stats_display)
+
+    def _on_closing(self):
+        """Clean up resources on window close"""
+        self.is_sniffing = False
+        self.is_playing_back = False
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except:
+                pass
+        self.destroy()
 
     def _load_db(self, path: str) -> Dict:
         """Load JSON database with error handling"""
@@ -120,7 +140,7 @@ class ModernCANApp(ctk.CTk):
         self.sidebar.grid_propagate(False)
 
         # Header with logo/title
-        header = ctk.CTkFrame(self.sidebar, fg_color=Colors.PRIMARY, corner_radius=0, height=70)
+        header = ctk.CTkFrame(self.sidebar, fg_color=Colors.PRIMARY, corner_radius=0, height=60)
         header.pack(fill="x", pady=(0, 20))
         header.pack_propagate(False)
 
@@ -186,7 +206,7 @@ class ModernCANApp(ctk.CTk):
         self.status_message = ctk.CTkLabel(
             self.status_bar,
             text="Ready",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=18),
             text_color=Colors.TEXT_SECONDARY,
             anchor="w"
         )
@@ -224,7 +244,7 @@ class ModernCANApp(ctk.CTk):
 
         self.port_combo = ctk.CTkComboBox(
             port_frame,
-            width=180,
+            width=260,
             fg_color=Colors.BG_LIGHT,
             border_color=Colors.BG_LIGHT,
             button_color=Colors.PRIMARY,
@@ -332,6 +352,16 @@ class ModernCANApp(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
             corner_radius=8
         ).pack(fill="x")
+        ctk.CTkButton(
+            section,
+            text="✏️ Manual Transmit",
+            command=self.open_manual_transmit,
+            fg_color=Colors.WARNING,
+            hover_color="#D97706",
+            height=40,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            corner_radius=8
+        ).pack(fill="x", pady=(5, 0))
 
     def _build_tools_section(self):
         """Build tools section"""
@@ -349,6 +379,8 @@ class ModernCANApp(ctk.CTk):
         tools = [
             ("📊 Statistics", self.show_statistics, Colors.SECONDARY),
             ("💾 Export CSV", self.export_session_log, Colors.INFO),
+            ("📂 Load Session", self.load_session_file, Colors.INFO),  # NEW
+            ("▶️ Playback Session", self.open_playback_dialog, Colors.SUCCESS),  # NEW
             ("🏷️ Manage IDs", self.win_manage_ids, Colors.PRIMARY),
             ("⚙️ Manage Functions", self.win_manage_funcs, Colors.PRIMARY),
             ("🗑️ Clear Monitor", self._clear_monitor, Colors.DANGER),
@@ -450,7 +482,8 @@ class ModernCANApp(ctk.CTk):
             stored_rows[can_id] = {
                 'last_data': row_data['last_data'].copy(),
                 'dev_name': row_data['dev_lbl'].cget("text"),
-                'func_name': row_data['func_lbl'].cget("text")
+                'func_name': row_data['func_lbl'].cget("text"),
+                'timestamp': row_data.get('timestamp', 0.0)  # NEW
             }
 
         # Clear display
@@ -474,56 +507,67 @@ class ModernCANApp(ctk.CTk):
             dev_name = data['dev_name']
             func_name = data['func_name']
             bytes_list = data['last_data']
+            timestamp = data['timestamp']  # NEW
 
-            # Create row (same as in _update_grouped_view for new rows)
+            # Create row
             row = self.row_counter_grouped
             self.row_counter_grouped += 1
-            bg = Colors.BG_DARK  # No highlight on rebuild
+            bg = Colors.BG_DARK
+
+            # NEW: Timestamp label
+            time_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=f"{timestamp:.3f}",
+                text_color=Colors.TEXT_MUTED,
+                width=70,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11)
+            )
+            time_l.grid(row=row, column=0, padx=4, pady=4, sticky="ew")
 
             id_l = ctk.CTkLabel(
                 self.scroll_grouped,
                 text=can_id,
                 text_color=Colors.PRIMARY,
                 cursor="hand2",
-                width=80,
+                width=60,
                 fg_color=bg,
                 font=ctk.CTkFont(size=11, weight="bold")
             )
-            id_l.grid(row=row, column=0, padx=8, pady=4, sticky="ew")
+            id_l.grid(row=row, column=1, padx=4, pady=4, sticky="ew")
             id_l.bind("<Button-1>", lambda e, cid=can_id: self._open_id_edit(cid))
 
             dev_l = ctk.CTkLabel(
                 self.scroll_grouped,
                 text=dev_name,
                 text_color=Colors.SUCCESS if dev_name != "Unknown" else Colors.TEXT_MUTED,
-                width=120,
+                width=100,
                 fg_color=bg,
                 font=ctk.CTkFont(size=11)
             )
-            dev_l.grid(row=row, column=1, padx=8, pady=4, sticky="ew")
+            dev_l.grid(row=row, column=2, padx=4, pady=4, sticky="ew")
 
             func_l = ctk.CTkLabel(
                 self.scroll_grouped,
                 text=func_name,
                 text_color=Colors.WARNING if func_name != "---" else Colors.TEXT_MUTED,
-                width=150,
+                width=120,
                 fg_color=bg,
                 font=ctk.CTkFont(size=11)
             )
-            func_l.grid(row=row, column=2, padx=8, pady=4, sticky="ew")
+            func_l.grid(row=row, column=3, padx=4, pady=4, sticky="ew")
 
-            # RTR, IDE, DLC (get from last_data or use defaults)
-            rtr_l = ctk.CTkLabel(self.scroll_grouped, text="0", text_color=Colors.TEXT_SECONDARY, width=40, fg_color=bg,
+            rtr_l = ctk.CTkLabel(self.scroll_grouped, text="0", text_color=Colors.TEXT_SECONDARY, width=35, fg_color=bg,
                                  font=ctk.CTkFont(size=11))
-            rtr_l.grid(row=row, column=3, padx=8, pady=4, sticky="ew")
+            rtr_l.grid(row=row, column=4, padx=4, pady=4, sticky="ew")
 
-            ide_l = ctk.CTkLabel(self.scroll_grouped, text="0", text_color=Colors.TEXT_SECONDARY, width=40, fg_color=bg,
+            ide_l = ctk.CTkLabel(self.scroll_grouped, text="0", text_color=Colors.TEXT_SECONDARY, width=35, fg_color=bg,
                                  font=ctk.CTkFont(size=11))
-            ide_l.grid(row=row, column=4, padx=8, pady=4, sticky="ew")
+            ide_l.grid(row=row, column=5, padx=4, pady=4, sticky="ew")
 
-            dlc_l = ctk.CTkLabel(self.scroll_grouped, text="8", text_color=Colors.TEXT_SECONDARY, width=40, fg_color=bg,
+            dlc_l = ctk.CTkLabel(self.scroll_grouped, text="8", text_color=Colors.TEXT_SECONDARY, width=35, fg_color=bg,
                                  font=ctk.CTkFont(size=11))
-            dlc_l.grid(row=row, column=5, padx=8, pady=4, sticky="ew")
+            dlc_l.grid(row=row, column=6, padx=4, pady=4, sticky="ew")
 
             # Data bytes
             b_labels = []
@@ -534,17 +578,17 @@ class ModernCANApp(ctk.CTk):
                     self.scroll_grouped,
                     text=val,
                     text_color=color,
-                    width=50,
+                    width=45,
                     fg_color=bg,
                     font=ctk.CTkFont(size=11)
                 )
-                l.grid(row=row, column=6 + j, padx=4, pady=4, sticky="ew")
+                l.grid(row=row, column=7 + j, padx=4, pady=4, sticky="ew")
                 b_labels.append(l)
 
             btn = ctk.CTkButton(
                 self.scroll_grouped,
                 text="+",
-                width=35,
+                width=40,
                 height=28,
                 command=lambda cid=can_id: self._save_function(cid),
                 fg_color=Colors.SUCCESS,
@@ -552,16 +596,18 @@ class ModernCANApp(ctk.CTk):
                 corner_radius=6,
                 font=ctk.CTkFont(size=14, weight="bold")
             )
-            btn.grid(row=row, column=14, padx=8, pady=4)
+            btn.grid(row=row, column=15, padx=4, pady=4)
 
-            widgets = [id_l, dev_l, func_l, rtr_l, ide_l, dlc_l] + b_labels
+            widgets = [time_l, id_l, dev_l, func_l, rtr_l, ide_l, dlc_l] + b_labels
             self.can_rows[can_id] = {
+                'time_lbl': time_l,  # NEW
                 'dev_lbl': dev_l,
                 'func_lbl': func_l,
                 'bytes': b_labels,
                 'last_data': bytes_list.copy(),
                 'widgets': widgets + [btn],
-                'bg': bg
+                'bg': bg,
+                'timestamp': timestamp  # NEW
             }
 
     def _rebuild_stream_view(self):
@@ -656,7 +702,7 @@ class ModernCANApp(ctk.CTk):
         """Open advanced filtering options"""
         win = ctk.CTkToplevel(self)
         win.title("Advanced Filters")
-        win.geometry("400x450")
+        win.geometry("400x500")
         win.attributes("-topmost", True)
         win.configure(fg_color=Colors.BG_DARK)
 
@@ -1115,42 +1161,85 @@ class ModernCANApp(ctk.CTk):
         )
         self.scroll_grouped.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
 
-        headers = ["ID", "Device", "Function", "RTR", "IDE", "DLC", "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", ""]
+        # UPDATED: Added Time column
+        headers = ["Time", "ID", "Device", "Function", "RTR", "IDE", "DLC", "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", ""]
 
         header_frame = ctk.CTkFrame(self.scroll_grouped, fg_color=Colors.BG_MEDIUM, corner_radius=0)
-        header_frame.grid(row=0, column=0, columnspan=15, sticky="ew", pady=(0, 2))
+        header_frame.grid(row=0, column=0, columnspan=16, sticky="ew", pady=(0, 2))
+
+        # Define consistent widths for each column type
+        column_widths = {
+            'time': 70,      # NEW
+            'id': 60,
+            'device': 100,
+            'function': 120,
+            'meta': 35,  # RTR, IDE, DLC
+            'byte': 45,  # D0-D7
+            'button': 40
+        }
 
         for i, h in enumerate(headers):
+            if i == 0:       # Time (NEW)
+                width = column_widths['time']
+            elif i == 1:     # ID
+                width = column_widths['id']
+            elif i == 2:     # Device
+                width = column_widths['device']
+            elif i == 3:     # Function
+                width = column_widths['function']
+            elif i in [4, 5, 6]:  # RTR, IDE, DLC
+                width = column_widths['meta']
+            elif i >= 7 and i <= 14:  # D0-D7
+                width = column_widths['byte']
+            else:            # Button column
+                width = column_widths['button']
+
             label = ctk.CTkLabel(
                 header_frame,
                 text=h,
                 font=ctk.CTkFont(size=11, weight="bold"),
                 text_color=Colors.TEXT_SECONDARY,
-                width=50 if i >= 6 else 80
+                width=width
             )
-            label.grid(row=0, column=i, padx=8, pady=10, sticky="w")
+            label.grid(row=0, column=i, padx=4, pady=10, sticky="ew")
 
-        # Stream view
+        # Stream view (unchanged)
         self.scroll_all = ctk.CTkScrollableFrame(
             self.main_content,
             fg_color=Colors.BG_DARK,
             corner_radius=0
         )
 
-        headers_stream = ["ID", "Device", "Function", "RTR", "IDE", "DLC", "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "Time", ""]
+        headers_stream = ["ID", "Device", "Function", "RTR", "IDE", "DLC", "D0", "D1", "D2", "D3", "D4", "D5", "D6",
+                          "D7", "Time", ""]
 
         header_frame_stream = ctk.CTkFrame(self.scroll_all, fg_color=Colors.BG_MEDIUM, corner_radius=0)
         header_frame_stream.grid(row=0, column=0, columnspan=16, sticky="ew", pady=(0, 2))
 
         for i, h in enumerate(headers_stream):
+            if i == 0:  # ID
+                width = column_widths['id']
+            elif i == 1:  # Device
+                width = column_widths['device']
+            elif i == 2:  # Function
+                width = column_widths['function']
+            elif i in [3, 4, 5]:  # RTR, IDE, DLC
+                width = column_widths['meta']
+            elif i >= 6 and i <= 13:  # D0-D7
+                width = column_widths['byte']
+            elif i == 14:  # Time
+                width = 80
+            else:  # Button column
+                width = column_widths['button']
+
             label = ctk.CTkLabel(
                 header_frame_stream,
                 text=h,
                 font=ctk.CTkFont(size=11, weight="bold"),
                 text_color=Colors.TEXT_SECONDARY,
-                width=50 if i >= 6 else 80
+                width=width
             )
-            label.grid(row=0, column=i, padx=8, pady=10, sticky="w")
+            label.grid(row=0, column=i, padx=4, pady=10, sticky="ew")
 
     def _darken_color(self, hex_color: str) -> str:
         """Darken a hex color by 20%"""
@@ -1210,6 +1299,8 @@ class ModernCANApp(ctk.CTk):
                 self.stats['last_update'] = datetime.now()
                 self.session_log.clear()
 
+                self.session_start_time = datetime.now()
+
                 self.btn_connect.configure(text="DISCONNECT", fg_color=Colors.DANGER)
                 self.status_lbl.configure(text="● CONNECTED", text_color=Colors.SUCCESS)
                 self.port_combo.configure(state="disabled")
@@ -1249,7 +1340,6 @@ class ModernCANApp(ctk.CTk):
         self.after(0, lambda: self.status_lbl.configure(text="● DISCONNECTED", text_color=Colors.TEXT_MUTED))
         self.after(0, lambda: self.port_combo.configure(state="normal"))
         self.after(0, lambda: self.btn_refresh.configure(state="normal"))
-        self.after(0, lambda: self.btn_send.configure(text="SEND COMMAND", fg_color=Colors.SECONDARY))
         self.after(0, lambda: self.btn_pause.configure(state="disabled"))
 
     def _serial_listener(self):
@@ -1317,7 +1407,8 @@ class ModernCANApp(ctk.CTk):
                         frame['rtr'],
                         frame['ide'],
                         frame['dlc'],
-                        frame['data']
+                        frame['data'],
+                        frame['timestamp']  # NEW: pass timestamp
                     )
 
                 processed += 1
@@ -1335,7 +1426,7 @@ class ModernCANApp(ctk.CTk):
 
         self.after(1000, self._update_stats_display)
 
-    def update_monitor(self, can_id: str, rtr: str, ide: str, dlc: str, bytes_list: List[str]):
+    def update_monitor(self, can_id: str, rtr: str, ide: str, dlc: str, bytes_list: List[str], timestamp: datetime = None):
         """Update monitor display with validation"""
         try:
             # Validate DLC
@@ -1399,10 +1490,16 @@ class ModernCANApp(ctk.CTk):
         mapping = self.function_labels.get(can_id, {})
         det_func = mapping.get("mappings", {}).get(data_str, "---")
 
+        # Calculate relative timestamp (NEW)
+        if timestamp and self.session_start_time:
+            relative_time = (timestamp - self.session_start_time).total_seconds()
+        else:
+            relative_time = 0.0
+
         if current_mode == "Stream":
             self._update_stream_view(can_id, rtr, ide, dlc, bytes_list, dev_name, det_func)
         else:
-            self._update_grouped_view(can_id, rtr, ide, dlc, bytes_list, dev_name, det_func, data_str)
+            self._update_grouped_view(can_id, rtr, ide, dlc, bytes_list, dev_name, det_func, data_str, relative_time)
 
     def _update_stream_view(self, can_id, rtr, ide, dlc, bytes_list, dev_name, det_func):
         """Update stream view"""
@@ -1446,6 +1543,20 @@ class ModernCANApp(ctk.CTk):
         widgets = []
 
         def add_lbl(txt, col, color=Colors.TEXT_PRIMARY, width=50):
+            # Apply consistent widths
+            if col == 0:  # ID
+                width = 60
+            elif col == 1:  # Device
+                width = 100
+            elif col == 2:  # Function
+                width = 120
+            elif col in [3, 4, 5]:  # RTR, IDE, DLC
+                width = 35
+            elif col >= 6 and col <= 13:  # D0-D7
+                width = 45
+            elif col == 14:  # Time
+                width = 80
+
             l = ctk.CTkLabel(
                 self.scroll_all,
                 text=txt,
@@ -1458,27 +1569,27 @@ class ModernCANApp(ctk.CTk):
             l.grid(row=row, column=col, padx=4, pady=1, sticky="ew")
             widgets.append(l)
 
-        add_lbl(can_id, 0, Colors.PRIMARY, 80)
-        add_lbl(dev_name, 1, Colors.SUCCESS if dev_name != "Unknown" else Colors.TEXT_MUTED, 120)
-        add_lbl(det_func, 2, Colors.WARNING if det_func != "---" else Colors.TEXT_MUTED, 150)
-        add_lbl(rtr, 3, Colors.TEXT_SECONDARY, 40)
-        add_lbl(ide, 4, Colors.TEXT_SECONDARY, 40)
-        add_lbl(dlc, 5, Colors.TEXT_SECONDARY, 40)
+        add_lbl(can_id, 0, Colors.PRIMARY)
+        add_lbl(dev_name, 1, Colors.SUCCESS if dev_name != "Unknown" else Colors.TEXT_MUTED)
+        add_lbl(det_func, 2, Colors.WARNING if det_func != "---" else Colors.TEXT_MUTED)
+        add_lbl(rtr, 3, Colors.TEXT_SECONDARY)
+        add_lbl(ide, 4, Colors.TEXT_SECONDARY)
+        add_lbl(dlc, 5, Colors.TEXT_SECONDARY)
 
         for j in range(8):
             val = bytes_list[j]
             color = Colors.DANGER if val != "00" else Colors.TEXT_MUTED
-            add_lbl(val, 6 + j, color, 40)
+            add_lbl(val, 6 + j, color)
 
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        add_lbl(timestamp, 14, Colors.TEXT_MUTED, 80)
+        add_lbl(timestamp, 14, Colors.TEXT_MUTED)
 
         # ADD SAVE BUTTON
         data_str = " ".join(bytes_list)
         btn = ctk.CTkButton(
             self.scroll_all,
             text="+",
-            width=30,
+            width=40,  # CHANGED
             height=24,
             command=lambda: self._save_function_stream(can_id, data_str),
             fg_color=Colors.SUCCESS,
@@ -1515,7 +1626,7 @@ class ModernCANApp(ctk.CTk):
             self._update_tx_list()
             self._show_status(f"✓ Function saved for ID {can_id}", 3000, Colors.SUCCESS)
 
-    def _update_grouped_view(self, can_id, rtr, ide, dlc, bytes_list, dev_name, det_func, data_str):
+    def _update_grouped_view(self, can_id, rtr, ide, dlc, bytes_list, dev_name, det_func, data_str, relative_time=0.0):
         """Update grouped view"""
         if can_id not in self.can_rows:
             # NEW ROW - insert at correct position based on sort order
@@ -1539,68 +1650,78 @@ class ModernCANApp(ctk.CTk):
             # Alternating background color - ALWAYS use BG_MEDIUM for highlight
             bg = Colors.BG_MEDIUM
 
-            # Create labels directly in grid (no container frame)
+            # NEW: Timestamp label (column 0)
+            time_l = ctk.CTkLabel(
+                self.scroll_grouped,
+                text=f"{relative_time:.3f}",
+                text_color=Colors.TEXT_MUTED,
+                width=70,
+                fg_color=bg,
+                font=ctk.CTkFont(size=11)
+            )
+            time_l.grid(row=row, column=0, padx=4, pady=4, sticky="ew")
+
             id_l = ctk.CTkLabel(
                 self.scroll_grouped,
                 text=can_id,
                 text_color=Colors.PRIMARY,
                 cursor="hand2",
-                width=80,
+                width=60,
                 fg_color=bg,
                 font=ctk.CTkFont(size=11, weight="bold")
             )
-            id_l.grid(row=row, column=0, padx=8, pady=4, sticky="ew")
+            id_l.grid(row=row, column=1, padx=4, pady=4, sticky="ew")
             id_l.bind("<Button-1>", lambda e, cid=can_id: self._open_id_edit(cid))
 
             dev_l = ctk.CTkLabel(
                 self.scroll_grouped,
                 text=dev_name,
                 text_color=Colors.SUCCESS if dev_name != "Unknown" else Colors.TEXT_MUTED,
-                width=120,
+                width=100,
                 fg_color=bg,
                 font=ctk.CTkFont(size=11)
             )
-            dev_l.grid(row=row, column=1, padx=8, pady=4, sticky="ew")
+            dev_l.grid(row=row, column=2, padx=4, pady=4, sticky="ew")
 
             func_l = ctk.CTkLabel(
                 self.scroll_grouped,
                 text=det_func,
                 text_color=Colors.WARNING if det_func != "---" else Colors.TEXT_MUTED,
-                width=150,
+                width=120,
                 fg_color=bg,
                 font=ctk.CTkFont(size=11)
             )
-            func_l.grid(row=row, column=2, padx=8, pady=4, sticky="ew")
+            func_l.grid(row=row, column=3, padx=4, pady=4, sticky="ew")
 
             rtr_l = ctk.CTkLabel(
                 self.scroll_grouped,
                 text=rtr,
                 text_color=Colors.TEXT_SECONDARY,
-                width=40,
+                width=35,
                 fg_color=bg,
                 font=ctk.CTkFont(size=11)
             )
-            rtr_l.grid(row=row, column=3, padx=8, pady=4, sticky="ew")
+            rtr_l.grid(row=row, column=4, padx=4, pady=4, sticky="ew")
 
             ide_l = ctk.CTkLabel(
                 self.scroll_grouped,
                 text=ide,
                 text_color=Colors.TEXT_SECONDARY,
-                width=40,
+                width=35,
                 fg_color=bg,
                 font=ctk.CTkFont(size=11)
             )
-            ide_l.grid(row=row, column=4, padx=8, pady=4, sticky="ew")
+            ide_l.grid(row=row, column=5, padx=4, pady=4, sticky="ew")
 
             dlc_l = ctk.CTkLabel(
                 self.scroll_grouped,
                 text=dlc,
                 text_color=Colors.TEXT_SECONDARY,
-                width=40,
+                width=35,
                 fg_color=bg,
                 font=ctk.CTkFont(size=11)
             )
-            dlc_l.grid(row=row, column=5, padx=8, pady=4, sticky="ew")
+            dlc_l.grid(row=row, column=6, padx=4, pady=4, sticky="ew")
 
             b_labels = []
             for j in range(8):
@@ -1610,17 +1731,17 @@ class ModernCANApp(ctk.CTk):
                     self.scroll_grouped,
                     text=val,
                     text_color=color,
-                    width=50,
+                    width=45,
                     fg_color=bg,
                     font=ctk.CTkFont(size=11)
                 )
-                l.grid(row=row, column=6 + j, padx=4, pady=4, sticky="ew")
+                l.grid(row=row, column=7 + j, padx=4, pady=4, sticky="ew")
                 b_labels.append(l)
 
             btn = ctk.CTkButton(
                 self.scroll_grouped,
                 text="+",
-                width=35,
+                width=40,
                 height=28,
                 command=lambda cid=can_id: self._save_function(cid),
                 fg_color=Colors.SUCCESS,
@@ -1628,22 +1749,24 @@ class ModernCANApp(ctk.CTk):
                 corner_radius=6,
                 font=ctk.CTkFont(size=14, weight="bold")
             )
-            btn.grid(row=row, column=14, padx=8, pady=4)
+            btn.grid(row=row, column=15, padx=4, pady=4)
 
-            widgets = [id_l, dev_l, func_l, rtr_l, ide_l, dlc_l] + b_labels  # Don't include button in fade list
+            widgets = [time_l, id_l, dev_l, func_l, rtr_l, ide_l, dlc_l] + b_labels
             self.can_rows[can_id] = {
+                'time_lbl': time_l,  # NEW
                 'dev_lbl': dev_l,
                 'func_lbl': func_l,
                 'bytes': b_labels,
                 'last_data': bytes_list.copy(),
-                'widgets': widgets + [btn],  # Include button for cleanup
-                'bg': bg
+                'widgets': widgets + [btn],
+                'bg': bg,
+                'timestamp': relative_time  # NEW
             }
 
             # Highlight animation - fade background to transparent (dark)
             def fade():
                 try:
-                    for w in widgets:  # Only fade labels, not button
+                    for w in widgets:
                         if w.winfo_exists():
                             w.configure(fg_color=Colors.BG_DARK)
                 except:
@@ -1654,6 +1777,11 @@ class ModernCANApp(ctk.CTk):
         else:
             # Update existing row
             r = self.can_rows[can_id]
+
+            # Update timestamp (NEW)
+            r['time_lbl'].configure(text=f"{relative_time:.3f}")
+            r['timestamp'] = relative_time
+
             r['func_lbl'].configure(
                 text=det_func,
                 text_color=Colors.WARNING if det_func != "---" else Colors.TEXT_MUTED
@@ -2074,6 +2202,8 @@ class ModernCANApp(ctk.CTk):
         else:
             self._show_status("✓ Display cleared (statistics preserved)", 4000, Colors.INFO)
 
+        self.session_start_time = datetime.now() if self.is_sniffing else None  # Add after stats reset
+
     def _show_toast(self, message: str, color: str):
         """Show a temporary toast notification"""
         toast = ctk.CTkFrame(
@@ -2173,7 +2303,423 @@ class ModernCANApp(ctk.CTk):
             percent = (count / total * 100) if total > 0 else 0
             device = self.id_labels.get(can_id, "Unknown")
             tree.insert('', tk.END, values=(f"{can_id} ({device})", count, f"{percent:.1f}%"))
+# ==================== MANUAL FRAME TRANSMISSION ====================
 
+    def open_manual_transmit(self):
+        """Open manual frame transmission window"""
+        win = ctk.CTkToplevel(self)
+        win.title("Manual Frame Transmission")
+        win.geometry("700x550")
+        win.attributes("-topmost", True)
+        win.configure(fg_color=Colors.BG_DARK)
+
+        main_frame = ctk.CTkFrame(win, fg_color=Colors.BG_DARK)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(main_frame, text="Manual CAN Frame Transmission",
+                     font=ctk.CTkFont(size=16, weight="bold"), text_color=Colors.TEXT_PRIMARY).pack(pady=(0, 20))
+
+        input_frame = ctk.CTkFrame(main_frame, fg_color=Colors.BG_MEDIUM, corner_radius=8)
+        input_frame.pack(fill="x", pady=(0, 15))
+
+        # Row 1: ID, RTR, IDE, DLC
+        row1 = ctk.CTkFrame(input_frame, fg_color="transparent")
+        row1.pack(fill="x", padx=15, pady=10)
+
+        ctk.CTkLabel(row1, text="ID (Hex):", width=70).pack(side="left", padx=(0, 5))
+        id_entry = ctk.CTkEntry(row1, width=80, fg_color=Colors.BG_LIGHT, placeholder_text="e.g. 7DF")
+        id_entry.pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(row1, text="RTR:").pack(side="left", padx=(0, 5))
+        rtr_var = ctk.StringVar(value="0")
+        ctk.CTkComboBox(row1, values=["0", "1"], width=60, variable=rtr_var, fg_color=Colors.BG_LIGHT).pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(row1, text="IDE:").pack(side="left", padx=(0, 5))
+        ide_var = ctk.StringVar(value="0")
+        ctk.CTkComboBox(row1, values=["0", "1"], width=60, variable=ide_var, fg_color=Colors.BG_LIGHT).pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(row1, text="DLC:").pack(side="left", padx=(0, 5))
+        dlc_var = ctk.StringVar(value="8")
+        ctk.CTkComboBox(row1, values=["0", "1", "2", "3", "4", "5", "6", "7", "8"], width=60,
+                        variable=dlc_var, fg_color=Colors.BG_LIGHT).pack(side="left")
+
+        # Row 2: Data bytes
+        row2 = ctk.CTkFrame(input_frame, fg_color="transparent")
+        row2.pack(fill="x", padx=15, pady=(0, 10))
+
+        ctk.CTkLabel(row2, text="Data (Hex):", width=70).pack(side="left", padx=(0, 5))
+
+        byte_entries = []
+        for i in range(8):
+            ctk.CTkLabel(row2, text=f"D{i}:", font=ctk.CTkFont(size=10)).pack(side="left", padx=(5, 2))
+            entry = ctk.CTkEntry(row2, width=40, fg_color=Colors.BG_LIGHT, placeholder_text="00")
+            entry.pack(side="left", padx=(0, 5))
+            byte_entries.append(entry)
+
+        # Row 3: Quick data input
+        row3 = ctk.CTkFrame(input_frame, fg_color="transparent")
+        row3.pack(fill="x", padx=15, pady=(0, 15))
+
+        ctk.CTkLabel(row3, text="Or paste data:", width=85).pack(side="left", padx=(0, 5))
+        quick_data_entry = ctk.CTkEntry(row3, width=300, fg_color=Colors.BG_LIGHT,
+                                        placeholder_text="e.g. 1B 2C 3D 4E 5F 00 00 00")
+        quick_data_entry.pack(side="left", padx=(0, 10))
+
+        def parse_quick_data():
+            data = quick_data_entry.get().strip().upper().replace(",", " ").replace("-", " ").replace(":", " ")
+            parts = data.split()
+            for i, entry in enumerate(byte_entries):
+                entry.delete(0, "end")
+                if i < len(parts):
+                    try:
+                        int(parts[i], 16)
+                        entry.insert(0, parts[i].zfill(2))
+                    except ValueError:
+                        entry.insert(0, "00")
+                else:
+                    entry.insert(0, "00")
+
+        ctk.CTkButton(row3, text="Parse", width=60, command=parse_quick_data, fg_color=Colors.INFO).pack(side="left")
+
+        # Transmission list
+        ctk.CTkLabel(main_frame, text="Transmission Queue:", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=Colors.TEXT_SECONDARY).pack(anchor="w", pady=(10, 5))
+
+        list_frame = ctk.CTkFrame(main_frame, fg_color=Colors.BG_MEDIUM)
+        list_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        style = ttk.Style()
+        style.configure("Manual.Treeview", background=Colors.BG_MEDIUM, foreground=Colors.TEXT_PRIMARY,
+                        fieldbackground=Colors.BG_MEDIUM)
+        style.configure("Manual.Treeview.Heading", background=Colors.BG_LIGHT, foreground=Colors.TEXT_PRIMARY)
+
+        tree = ttk.Treeview(list_frame, columns=("id", "rtr", "ide", "dlc", "data"), show='headings',
+                            style="Manual.Treeview", height=8)
+        tree.heading("id", text="ID")
+        tree.heading("rtr", text="RTR")
+        tree.heading("ide", text="IDE")
+        tree.heading("dlc", text="DLC")
+        tree.heading("data", text="Data")
+        tree.column("id", width=80, anchor="center")
+        tree.column("rtr", width=50, anchor="center")
+        tree.column("ide", width=50, anchor="center")
+        tree.column("dlc", width=50, anchor="center")
+        tree.column("data", width=300, anchor="center")
+        tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        manual_frames = []
+
+        def add_frame():
+            can_id = id_entry.get().strip().upper()
+            if not can_id:
+                self._show_status("⚠ ID is required!", 3000, Colors.WARNING)
+                return
+            try:
+                int(can_id, 16)
+            except ValueError:
+                self._show_status("⚠ Invalid hex ID!", 3000, Colors.WARNING)
+                return
+
+            data_bytes = []
+            dlc = int(dlc_var.get())
+            for i in range(dlc):
+                val = byte_entries[i].get().strip().upper() or "00"
+                try:
+                    int(val, 16)
+                    data_bytes.append(val.zfill(2))
+                except ValueError:
+                    self._show_status(f"⚠ Invalid hex in D{i}!", 3000, Colors.WARNING)
+                    return
+
+            data_str = " ".join(data_bytes)
+            frame = {'id': can_id, 'rtr': rtr_var.get(), 'ide': ide_var.get(), 'dlc': str(dlc), 'data': data_str}
+            manual_frames.append(frame)
+            tree.insert('', 'end', values=(can_id, rtr_var.get(), ide_var.get(), dlc, data_str))
+
+            id_entry.delete(0, "end")
+            for entry in byte_entries:
+                entry.delete(0, "end")
+            quick_data_entry.delete(0, "end")
+            self._show_status(f"✓ Frame added: {can_id}", 2000, Colors.SUCCESS)
+
+        def remove_selected():
+            sel = tree.selection()
+            if sel:
+                idx = tree.index(sel[0])
+                tree.delete(sel[0])
+                if idx < len(manual_frames):
+                    manual_frames.pop(idx)
+
+        def clear_all():
+            for item in tree.get_children():
+                tree.delete(item)
+            manual_frames.clear()
+
+        def send_all():
+            if not self.ser or not self.ser.is_open:
+                self._show_status("⚠ Not connected!", 3000, Colors.WARNING)
+                return
+            if not manual_frames:
+                self._show_status("⚠ No frames to send!", 3000, Colors.WARNING)
+                return
+            try:
+                delay = int(delay_entry.get())
+            except ValueError:
+                delay = 10
+
+            def send_thread():
+                for frame in manual_frames:
+                    if not self.is_sniffing:
+                        break
+                    command = f"SEND:{frame['id']}|{frame['data']}\n"
+                    try:
+                        self.ser.write(command.encode('utf-8'))
+                    except Exception as e:
+                        self.after(0, lambda: self._show_status(f"✗ Send error: {e}", 3000, Colors.DANGER))
+                        return
+                    time.sleep(delay / 1000.0)
+                self.after(0, lambda: self._show_status(f"✓ Sent {len(manual_frames)} frames", 3000, Colors.SUCCESS))
+
+            threading.Thread(target=send_thread, daemon=True).start()
+
+        def send_once_selected():
+            sel = tree.selection()
+            if not sel:
+                self._show_status("⚠ Select a frame!", 3000, Colors.WARNING)
+                return
+            if not self.ser or not self.ser.is_open:
+                self._show_status("⚠ Not connected!", 3000, Colors.WARNING)
+                return
+            idx = tree.index(sel[0])
+            if idx < len(manual_frames):
+                frame = manual_frames[idx]
+                command = f"SEND:{frame['id']}|{frame['data']}\n"
+                try:
+                    self.ser.write(command.encode('utf-8'))
+                    self._show_status(f"✓ Sent: {frame['id']}", 2000, Colors.SUCCESS)
+                except Exception as e:
+                    self._show_status(f"✗ Send error: {e}", 3000, Colors.DANGER)
+
+        # Button frame
+        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        btn_frame.pack(fill="x")
+
+        ctk.CTkButton(btn_frame, text="Add Frame", command=add_frame, fg_color=Colors.SUCCESS, width=100).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Remove", command=remove_selected, fg_color=Colors.DANGER, width=80).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Clear All", command=clear_all, fg_color=Colors.BG_LIGHT, width=80).pack(side="left", padx=5)
+
+        ctk.CTkFrame(btn_frame, fg_color="transparent", width=50).pack(side="left", padx=10)
+
+        ctk.CTkLabel(btn_frame, text="Delay (ms):").pack(side="left", padx=(0, 5))
+        delay_entry = ctk.CTkEntry(btn_frame, width=60, fg_color=Colors.BG_LIGHT)
+        delay_entry.insert(0, "10")
+        delay_entry.pack(side="left", padx=(0, 10))
+
+        ctk.CTkButton(btn_frame, text="Send Selected", command=send_once_selected, fg_color=Colors.INFO, width=110).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Send All", command=send_all, fg_color=Colors.PRIMARY, width=100).pack(side="left", padx=5)
+
+    # ==================== SESSION LOAD/PLAYBACK ====================
+
+    def load_session_file(self):
+        """Load a previously exported CSV session file"""
+        filepath = filedialog.askopenfilename(title="Load Session File",
+                                              filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not filepath:
+            return
+
+        try:
+            loaded_frames = []
+            with open(filepath, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    loaded_frames.append({
+                        'timestamp': row.get('timestamp', '00:00:00.000'),
+                        'id': row.get('id', '000').upper(),
+                        'rtr': row.get('rtr', '0'),
+                        'ide': row.get('ide', '0'),
+                        'dlc': row.get('dlc', '8'),
+                        'data': row.get('data', '00 00 00 00 00 00 00 00')
+                    })
+
+            if not loaded_frames:
+                self._show_status("⚠ No frames found in file!", 3000, Colors.WARNING)
+                return
+
+            self.loaded_session = loaded_frames
+            self._show_status(f"✓ Loaded {len(loaded_frames)} frames from session", 4000, Colors.SUCCESS)
+
+            if messagebox.askyesno("Session Loaded", f"Loaded {len(loaded_frames)} frames.\n\nDisplay them in the monitor now?"):
+                self._display_loaded_session()
+
+        except Exception as e:
+            self._show_status(f"✗ Failed to load: {e}", 5000, Colors.DANGER)
+            messagebox.showerror("Load Error", f"Failed to load session file:\n{str(e)}")
+
+    def _display_loaded_session(self):
+        """Display loaded session frames in the monitor"""
+        if not self.loaded_session:
+            return
+        self._clear_monitor_silent()
+        for frame in self.loaded_session:
+            data_list = frame['data'].split()
+            while len(data_list) < 8:
+                data_list.append("00")
+            self.update_monitor(frame['id'], frame['rtr'], frame['ide'], frame['dlc'], data_list[:8])
+
+    def _clear_monitor_silent(self):
+        """Clear monitor without confirmation dialog"""
+        for r in self.can_rows.values():
+            for w in r['widgets']:
+                try:
+                    w.destroy()
+                except:
+                    pass
+        self.can_rows.clear()
+        self.row_counter_grouped = 1
+
+        for row_widgets in self.all_msgs_widgets:
+            for w in row_widgets:
+                try:
+                    w.destroy()
+                except:
+                    pass
+        self.all_msgs_widgets.clear()
+        self.row_counter_all = 1
+
+    def open_playback_dialog(self):
+        """Open playback configuration dialog"""
+        if not self.loaded_session:
+            self.load_session_file()
+            if not self.loaded_session:
+                return
+
+        win = ctk.CTkToplevel(self)
+        win.title("Session Playback")
+        win.geometry("500x500")
+        win.attributes("-topmost", True)
+        win.configure(fg_color=Colors.BG_DARK)
+
+        main_frame = ctk.CTkFrame(win, fg_color=Colors.BG_DARK)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(main_frame, text="Session Playback", font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color=Colors.TEXT_PRIMARY).pack(pady=(0, 20))
+
+        info_frame = ctk.CTkFrame(main_frame, fg_color=Colors.BG_MEDIUM, corner_radius=8)
+        info_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(info_frame, text=f"Loaded Session: {len(self.loaded_session)} frames",
+                     font=ctk.CTkFont(size=13), text_color=Colors.SUCCESS).pack(pady=15)
+
+        options_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        options_frame.pack(fill="x", pady=(0, 20))
+
+        speed_frame = ctk.CTkFrame(options_frame, fg_color=Colors.BG_MEDIUM, corner_radius=8)
+        speed_frame.pack(fill="x", pady=5)
+
+        ctk.CTkLabel(speed_frame, text="Playback Speed:", text_color=Colors.TEXT_SECONDARY).pack(side="left", padx=15, pady=15)
+        speed_var = ctk.StringVar(value="1x")
+        ctk.CTkComboBox(speed_frame, values=["0.25x", "0.5x", "1x", "2x", "4x", "10x", "Max"],
+                        variable=speed_var, width=100, fg_color=Colors.BG_LIGHT).pack(side="left", padx=10, pady=15)
+
+        transmit_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(options_frame, text="Also transmit frames to CAN bus (requires connection)",
+                        variable=transmit_var, fg_color=Colors.PRIMARY).pack(anchor="w", pady=10)
+
+        loop_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(options_frame, text="Loop playback continuously",
+                        variable=loop_var, fg_color=Colors.PRIMARY).pack(anchor="w", pady=5)
+
+        playback_progress = ctk.CTkProgressBar(main_frame, fg_color=Colors.BG_MEDIUM, progress_color=Colors.SUCCESS)
+        playback_progress.pack(fill="x", pady=10)
+        playback_progress.set(0)
+
+        playback_status = ctk.CTkLabel(main_frame, text="Ready to play", font=ctk.CTkFont(size=12),
+                                       text_color=Colors.TEXT_SECONDARY)
+        playback_status.pack(pady=5)
+
+        def get_speed_multiplier():
+            speeds = {"0.25x": 4.0, "0.5x": 2.0, "1x": 1.0, "2x": 0.5, "4x": 0.25, "10x": 0.1, "Max": 0.0}
+            return speeds.get(speed_var.get(), 1.0)
+
+        def start_playback():
+            if self.is_playing_back:
+                return
+            self.is_playing_back = True
+            self._clear_monitor_silent()
+            speed_mult = get_speed_multiplier()
+            do_transmit = transmit_var.get()
+            do_loop = loop_var.get()
+
+            def playback_thread():
+                while self.is_playing_back:
+                    total = len(self.loaded_session)
+                    prev_time = None
+
+                    for idx, frame in enumerate(self.loaded_session):
+                        if not self.is_playing_back:
+                            break
+
+                        delay = 0.01
+                        if speed_mult > 0:
+                            try:
+                                time_str = frame['timestamp']
+                                parts = time_str.split(':')
+                                if len(parts) == 3:
+                                    h, m, rest = parts
+                                    s_parts = rest.split('.')
+                                    s = float(s_parts[0])
+                                    ms = float(s_parts[1]) / 1000 if len(s_parts) > 1 else 0
+                                    current_time = int(h) * 3600 + int(m) * 60 + s + ms
+                                    if prev_time is not None:
+                                        delay = (current_time - prev_time) * speed_mult
+                                        delay = max(0, min(delay, 5.0))
+                                    prev_time = current_time
+                            except:
+                                delay = 0.01 * speed_mult
+
+                        progress = (idx + 1) / total
+                        self.after(0, lambda p=progress: playback_progress.set(p))
+                        self.after(0, lambda i=idx, t=total: playback_status.configure(text=f"Playing: {i + 1}/{t}"))
+
+                        data_list = frame['data'].split()
+                        while len(data_list) < 8:
+                            data_list.append("00")
+
+                        self.after(0, lambda f=frame, d=data_list: self.update_monitor(
+                            f['id'], f['rtr'], f['ide'], f['dlc'], d[:8]))
+
+                        if do_transmit and self.ser and self.ser.is_open:
+                            command = f"SEND:{frame['id']}|{frame['data']}\n"
+                            try:
+                                self.ser.write(command.encode('utf-8'))
+                            except:
+                                pass
+
+                        if delay > 0:
+                            time.sleep(delay)
+
+                    if not do_loop:
+                        break
+
+                self.is_playing_back = False
+                self.after(0, lambda: playback_status.configure(text="Playback complete"))
+                self.after(0, lambda: self._show_status("✓ Playback complete", 3000, Colors.SUCCESS))
+
+            threading.Thread(target=playback_thread, daemon=True).start()
+
+        def stop_playback():
+            self.is_playing_back = False
+            playback_status.configure(text="Stopped")
+
+        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        btn_frame.pack(pady=20)
+
+        ctk.CTkButton(btn_frame, text="▶ Play", command=start_playback, fg_color=Colors.SUCCESS,
+                      hover_color="#059669", width=120, height=40).pack(side="left", padx=10)
+        ctk.CTkButton(btn_frame, text="⏹ Stop", command=stop_playback, fg_color=Colors.DANGER,
+                      hover_color="#DC2626", width=120, height=40).pack(side="left", padx=10)
+        ctk.CTkButton(btn_frame, text="Close", command=lambda: [stop_playback(), win.destroy()],
+                      fg_color=Colors.BG_LIGHT, width=100, height=40).pack(side="left", padx=10)
 
 if __name__ == "__main__":
     app = ModernCANApp()
