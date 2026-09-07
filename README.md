@@ -5,7 +5,6 @@ A powerful, multithreaded desktop application designed for real-time CAN bus rev
 This project was developed as the core software component of my **B.Sc. Engineering Thesis** at AGH University of Krakow. It works in tandem with a custom-built ESP32-based hardware interface to provide a comprehensive Hardware-in-the-Loop (HIL) testing environment.
 
 ## ⚠️ Developer Note: Architecture & Technical Debt
-*This section is for reviewing engineers and technical recruiters.*
 
 Currently, the application is structured as a single-file monolith (`main.py` ~1000 lines). This architecture was an intentional trade-off made during the rapid prototyping phase of my thesis to facilitate quick hardware-software integration tests directly inside a vehicle.
 
